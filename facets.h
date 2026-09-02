@@ -117,6 +117,7 @@ struct DirLine {
     bool has_bytes = true;
     bool note = false;          // a fold / files-here line
     uint32_t node = 0;          // 0 = none
+    bool here = false;          // the files directly inside node (selectable with parent:"DIR\")
 };
 // rows below this are folded into "+N more": --min verbatim, else 1 % of the result set
 uint64_t fold_threshold(const Opts& o, uint64_t items);

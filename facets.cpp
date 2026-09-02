@@ -292,7 +292,10 @@ static void expand_dir(const Facets& f, const Opts& o, uint32_t node, int level,
         out.push_back({ level, narrow(label), f.nodes[cur].count, f.nodes[cur].bytes, true, false, cur });
         if (f.nodes[cur].count * 20 >= f.items) expand_dir(f, o, cur, level + 1, thr, out);   // open only what holds >= 5 %
     }
-    if (n.self > 0 && shown > 0) out.push_back({ level, "(files right here)", n.self, 0, false, true, node });
+    if (n.self > 0 && shown > 0) {
+        out.push_back({ level, "(files right here)", n.self, 0, false, true, node });
+        out.back().here = true;
+    }
     if (rest_n) out.push_back({ level, ssprintf("+%d more %s", rest_n, rest_n == 1 ? "directory" : "directories"), rest, 0, false, true, 0 });
 }
 
@@ -314,6 +317,7 @@ std::vector<DirLine> dir_lines(const Facets& f, const Opts& o) {
         shown++;
         if (t.root_files) {
             out.push_back({ 0, narrow(f.dir_path(t.node)) + "  (files at the root)", t.count, 0, false, false, t.node });
+            out.back().here = true;
             continue;
         }
         uint32_t cur = t.node;
@@ -330,7 +334,10 @@ std::vector<DirLine> flat_lines(const Facets& f, const Opts& o) {
     for (uint32_t id = 1; id < (uint32_t)f.nodes.size(); ++id) {
         const DirNode& n = f.nodes[id];
         if (n.depth == (uint32_t)o.flat) all.push_back({ 0, narrow(f.dir_path(id)), n.count, n.bytes, true, false, id });
-        else if (n.depth < (uint32_t)o.flat && n.self > 0) all.push_back({ 0, narrow(f.dir_path(id)) + "  (files right here)", n.self, 0, false, false, id });
+        else if (n.depth < (uint32_t)o.flat && n.self > 0) {
+            all.push_back({ 0, narrow(f.dir_path(id)) + "  (files right here)", n.self, 0, false, false, id });
+            all.back().here = true;
+        }
     }
     std::sort(all.begin(), all.end(), [](const DirLine& a, const DirLine& b) { return a.count > b.count; });
     const uint64_t thr = fold_threshold(o, f.items);

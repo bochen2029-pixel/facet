@@ -92,7 +92,8 @@ QUERY  ext:md dm:last3days
 - **Query box** — Everything syntax, verbatim; the search re-runs as you type (260 ms after the
   last key), Enter runs it now.
 - **Facet rail** — the report's sections, live. Left-click a directory, extension, bucket or
-  burst to keep only it; right-click to exclude it. Each pick becomes a **chip**; the chips
+  burst to keep only it; right-click to exclude it (*(files right here)* rows select the files
+  directly inside a folder, through Everything's `parent:`). Each pick becomes a **chip**; the chips
   compile into the query in the status line and the whole thing is re-run through Everything,
   so every count is Everything's. `×` removes a chip, Esc clears them all. Right-click a `not …`
   chip to pin it as a standing exclude: it is kept in `facet.ini` next to the exe and applied on
@@ -105,9 +106,10 @@ QUERY  ext:md dm:last3days
 - `--shot FILE.png` renders the window once, saves it and exits — the screenshot above was
   taken that way, no hands.
 
-Everything streams on a worker thread with its own IPC window; a new keystroke cancels the pass
-in flight at its next page. Up to 200,000 rows are kept for the table; the facets always cover
-the whole result set.
+Everything streams on a worker thread with its own IPC window; the tally counts up while a long
+pass runs (the whole disk takes ~10 s), and a new keystroke cancels the pass in flight at its
+next page. Up to 200,000 rows are kept for the table; the facets always cover the whole result
+set unless the window was started with `-n`.
 
 ## The numbers, honestly
 

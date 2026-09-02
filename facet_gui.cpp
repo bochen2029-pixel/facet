@@ -120,6 +120,7 @@ struct Gui {
     bool quit = false;
     HANDLE thread = nullptr;
     std::atomic<uint32_t> gen{ 0 };
+    std::atomic<uint64_t> progress_items{ 0 }, progress_total{ 0 };   // the pass in flight, for the tally
     // state
     std::wstring query;
     std::vector<Chip> chips;
@@ -146,7 +147,7 @@ struct Gui {
 Gui* g = nullptr;
 
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
-constexpr UINT_PTR kDebounceTimer = 1, kShotTimer = 2;
+constexpr UINT_PTR kDebounceTimer = 1, kShotTimer = 2, kProgressTimer = 3;
 constexpr int kEditId = 100;
 constexpr uint32_t kRowsCap = 200000;
 enum { kMenuOpen = 1, kMenuOpenFolder, kMenuCopyPath, kMenuCopyName, kMenuDrill, kMenuExclude };
@@ -314,10 +315,14 @@ DWORD WINAPI worker(LPVOID) {
         const double t0 = now_ms();
         bool stale = false;
         const uint32_t req = ipc::kReqName | ipc::kReqPath | ipc::kReqSize | ipc::kReqModified;
-        const bool ok = es.query(r.compiled, ipc_sort(r.sort, r.ascending), 0, 0, s.opts.page, req,
+        s.progress_items = 0;
+        s.progress_total = 0;
+        const bool ok = es.query(r.compiled, ipc_sort(r.sort, r.ascending), 0, s.opts.max_rows, s.opts.page, req,
                                  [&](const EsPage& pg, const EsItem* it, uint32_t n) {
                                      res->total = pg.total;
                                      for (uint32_t i = 0; i < n; ++i) res->f->add(it[i]);
+                                     s.progress_items = res->f->items;
+                                     s.progress_total = pg.total;
                                      if (s.gen.load() != r.gen) { stale = true; return false; }
                                      return true;
                                  }, &res->err);
@@ -351,6 +356,7 @@ void submit(Gui& s) {
     ReleaseSRWLockExclusive(&s.lock);
     WakeConditionVariable(&s.cv);
     s.busy = true;
+    SetTimer(s.hwnd, kProgressTimer, 200, nullptr);   // repaint the tally while the pass runs
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
@@ -413,7 +419,15 @@ void build_rail(Gui& s) {
         r.label = widen(dl.label);
         r.right = widen(fmt_count(dl.count));
         r.frac = f.items ? (double)dl.count / (double)f.items : 0.0;
-        if (!dl.note && dl.node) {
+        if (dl.here && dl.node) {
+            const std::wstring p = f.dir_path(dl.node);   // the files directly inside: Everything's parent: function
+            r.kind = RowKind::Dir;
+            r.actionable = true;
+            r.inc = { Filter::Kind::Term, L"parent:\"" + p + L"\"" };
+            r.exc = { Filter::Kind::Term, L"!parent:\"" + p + L"\"" };
+            r.group = "dir";
+            r.hint = L"click: only the files directly in " + p + L"   ·   right-click: exclude them";
+        } else if (!dl.note && dl.node) {
             const std::wstring p = f.dir_path(dl.node);
             r.actionable = true;
             r.inc = { Filter::Kind::DirIn, p };
@@ -587,8 +601,10 @@ void paint(Gui& s, HDC dc, RECT client) {
     }
     {
         std::wstring tally;
-        if (s.busy) tally = L"searching…";
-        else if (s.res && !s.res->err.empty()) tally = L"! " + widen(s.res->err);
+        if (s.busy) {
+            const uint64_t done = s.progress_items.load(), tot = s.progress_total.load();
+            tally = tot ? L"searching…  " + widen(fmt_count(done)) + L" of " + widen(fmt_count(tot)) : L"searching…";
+        } else if (s.res && !s.res->err.empty()) tally = L"! " + widen(s.res->err);
         else if (f) tally = widen(fmt_count(s.res->total)) + L" items · " + widen(ssprintf("%.0f ms", s.res->ms));
         RECT tr = rect(s.rcTop.right - px(s, 250), s.rcTop.top, s.rcTop.right - m, s.rcTop.bottom);
         draw_text(dc, s.fBold, (s.res && !s.res->err.empty()) ? kRed : kDim, tr, tally, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
@@ -925,6 +941,17 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 const bool ok = save_shot(h, widen(s.opts.shot));
                 fprintf(stderr, "facet: %s %s\n", ok ? "saved" : "could not save", s.opts.shot.c_str());
                 DestroyWindow(h);
+            } else if (wp == kProgressTimer) {
+                if (!s.busy) KillTimer(h, kProgressTimer);
+                else InvalidateRect(h, &s.rcTop, FALSE);
+            }
+            return 0;
+        case WM_CHAR:
+            // typing while the table has focus goes to the query box
+            if (wp >= 0x20 && wp != 0x7F && GetFocus() == h) {
+                SetFocus(s.edit);
+                SendMessageW(s.edit, EM_SETSEL, (WPARAM)-1, -1);
+                SendMessageW(s.edit, WM_CHAR, wp, lp);
             }
             return 0;
         case WM_APP_RESULT:

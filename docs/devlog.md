@@ -80,3 +80,10 @@ Running notes, newest at the bottom. Decisions, measurements, test results.
     it 2.6× LARGER (ClearType noise compresses badly) — keep the native capture (~300 KB).
 - Rail defaults in the window: top 8, depth 2, and a subtree only opens when it holds >= 5 % of
   the result set (also applied to the report), so the other facets stay reachable.
+- Everything 1.4 `parent:"C:\NEW\"` selects the files directly inside a folder (4 of the 145 in
+  the subtree here) and negates cleanly (`!parent:` = 3,806); `infolder:` and `nosubfolders:`
+  give the same count. The window's "(files right here)" rows compile to it.
+- Window tally shows "searching… N of T" from a per-page atomic while a pass runs; typing while
+  the table has focus is forwarded to the query box; `-n` caps the window's pass like the CLI.
+- C:\Everything\README.md (the AI-session locator doc) now points at facet for the "where did
+  the matches go" question, so future sessions find it without being told.
