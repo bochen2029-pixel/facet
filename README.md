@@ -36,6 +36,7 @@ facet --gui [query]                    the window: click a facet to drill in, ri
 facet --shortcut                       put "facet" in the Start Menu (type facet in Start, pin it from there) · --shortcut desktop
 facet --mcp                            MCP stdio server — tools: facet_query, facet_list, facet_count
 facet --where                          which Everything.exe facet found, whether it is running, what is indexed
+facet --about                          the organ's self-description as JSON: verbs, MCP, health — what `peek env` reads
 facet --selftest                       parser, fold, compiler, formatting + live IPC checks
 facet --help                           every flag, the JSON shape, exit codes
 ```

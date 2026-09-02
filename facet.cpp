@@ -1190,6 +1190,38 @@ static int run_count(const Opts& o) {
 }
 
 // --where: what facet would talk to — the exe it found, whether an instance is up, what is indexed
+// --about: the organ describes itself as one JSON object — the contract `peek env` reads so the
+// machine map asks the tools instead of hardcoding them (name, verbs, MCP, health, docs).
+static int run_about(const Opts& o) {
+    wchar_t buf[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, (DWORD)(sizeof buf / sizeof buf[0]));
+    const std::wstring exe(buf, n);
+    const std::wstring dir = exe.substr(0, exe.find_last_of(L'\\') + 1);
+    const std::wstring es_exe = find_everything_exe(o.everything_exe);
+    Everything es;
+    es.launch.allow_start = false;
+    const bool running = es.running();
+    std::string j = "{\"organ\":\"facet\",\"version\":" + jstr(kVersion) + ",\"path\":" + jw(exe) + ",\"family\":\"everything/facet · everywhere · everywhen · vramtop · everywho\"";
+    j += ",\"purpose\":\"pivot filtering over Everything's index: which files, and where they went (directory tree, extension, modified, size, write bursts); every pick compiles back into Everything syntax; --grep scans their contents with everywhere\"";
+    j += ",\"verbs\":[";
+    j += "{\"verb\":\"facet <query>\",\"what\":\"the report: directories, extensions, modified, size, bursts, the compiled query\",\"example\":\"facet ext:md dm:last3days\"},";
+    j += "{\"verb\":\"facet -j <query>\",\"what\":\"the report as JSON for agents\",\"example\":\"facet -j -x C:\\\\vendor ext:md dm:today\"},";
+    j += "{\"verb\":\"facet -l -n N <query>\",\"what\":\"rows, newest first (-ll adds size and date)\",\"example\":\"facet -l -n 50 ext:pdf size:>10mb\"},";
+    j += "{\"verb\":\"facet -c <query>\",\"what\":\"count only, ~40 ms\",\"example\":\"facet -c ext:md dm:today\"},";
+    j += "{\"verb\":\"facet --grep W <query>\",\"what\":\"names -> contents -> where: only files whose contents hold W (everywhere)\",\"example\":\"facet --grep join ext:md dm:last7days\"},";
+    j += "{\"verb\":\"facet --paths <query>\",\"what\":\"the result set as a tape (one path per line) for everywhere / everywho\",\"example\":\"facet --paths ext:md dm:today | everywhere --files-from - -e word -l\"},";
+    j += "{\"verb\":\"facet --files-from F|-\",\"what\":\"fold a tape instead of a query; --and/--or/--not for set algebra\",\"example\":\"everywhere -l secret C:\\\\Data | facet --files-from -\"},";
+    j += "{\"verb\":\"facet --gui\",\"what\":\"the window (facetw.exe = no console): a rail you click, chips, a contains box\",\"example\":\"facetw.exe\"},";
+    j += "{\"verb\":\"facet --where\",\"what\":\"which Everything.exe, whether it runs, what is indexed\",\"example\":\"facet --where -j\"}";
+    j += "]";
+    j += ",\"mcp\":{\"command\":" + jw(exe) + ",\"args\":[\"--mcp\"],\"tools\":[\"facet_query\",\"facet_list\",\"facet_count\"],\"register\":" + jstr("claude mcp add facet -- " + narrow(exe) + " --mcp") + "}";
+    j += ",\"health\":{\"ok\":" + std::string(running ? "true" : "false") + ",\"everything_running\":" + (running ? "true" : "false") + ",\"everything_exe\":" + (es_exe.empty() ? std::string("null") : jw(es_exe)) +
+         ",\"detail\":" + jstr(running ? "Everything is running; facet answers" : es_exe.empty() ? "Everything is not installed (https://www.voidtools.com/downloads/)" : "Everything is installed but not running; facet starts it on first use") + "}";
+    j += ",\"docs\":" + jw(dir + L"README.md") + ",\"tape\":{\"writes\":\"--paths\",\"reads\":\"--files-from, --and, --or, --not\"}}\n";
+    write_out(j);
+    return 0;
+}
+
 static int run_where(const Opts& o) {
     const std::wstring exe = find_everything_exe(o.everything_exe);
     Everything es;
@@ -1910,6 +1942,7 @@ int app_main(int argc, wchar_t** argv) {
         else if (a == "--mcp") o.mode = Opts::Mode::Mcp;
         else if (a == "--selftest") o.mode = Opts::Mode::Selftest;
         else if (a == "--where") o.mode = Opts::Mode::Where;
+        else if (a == "--about") { o.mode = Opts::Mode::About; o.json = true; }
         else if (a == "--make-icon") { o.mode = Opts::Mode::MakeIcon; o.out_file = narrow(need_str(argc, argv, i, "--make-icon")); }
         else if (a == "--shortcut") {
             o.mode = Opts::Mode::Shortcut;
@@ -1971,6 +2004,7 @@ int app_main(int argc, wchar_t** argv) {
         case Opts::Mode::Version: printf("facet %s\n", kVersion); return 0;
         case Opts::Mode::Mcp: return run_mcp(o);
         case Opts::Mode::Where: return run_where(o);
+        case Opts::Mode::About: return run_about(o);
         case Opts::Mode::MakeIcon: return write_icon_file(o.out_file);
         case Opts::Mode::Shortcut: return make_shortcut(o.out_file);
         case Opts::Mode::Selftest: { console_setup(o); return run_selftest(o); }

@@ -20,7 +20,7 @@ constexpr uint64_t kTicksPerDay = 864000000000ull;
 enum class SortKey { Modified, Name, Path, Size, Ext, Created, Recent, Hits };
 
 struct Opts {
-    enum class Mode { Auto, Report, List, Count, Paths, Gui, Mcp, Selftest, Where, MakeIcon, Shortcut, Help, Version };
+    enum class Mode { Auto, Report, List, Count, Paths, Gui, Mcp, Selftest, Where, About, MakeIcon, Shortcut, Help, Version };
     Mode mode = Mode::Auto;
     bool json = false;
     std::wstring query;                    // the Everything query, verbatim

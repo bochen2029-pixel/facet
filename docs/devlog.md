@@ -167,3 +167,11 @@ Running notes, newest at the bottom. Decisions, measurements, test results.
   with --grep over a tape (2 of 3 folded), pipeline_text.
 - Guard: --scan-max (1,000,000 files) refuses a scan that would take minutes and says so; the
   tally is the budget.
+
+## 2026-09-02 · `--about`: the family's self-description contract (for peek)
+
+- `facet --about` prints one JSON object: organ, version, path, purpose, verbs (with an example
+  each), the MCP command / tools / registration line, health right now (Everything running?
+  installed?), docs, and which tape verbs it speaks. `peek env` (0.3) asks every organ for this
+  instead of hardcoding a list; `peek --mcp` uses the `mcp` block to spawn and proxy. Before /
+  after copies of the edited files: `C:\Intellect_AI_tools\_snapshots\` (peek-integration).
