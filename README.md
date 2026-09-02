@@ -30,6 +30,8 @@ facet --flat 2 ""                      every item on every volume, ranked by dri
 facet -l -n 50 ext:md dm:today         rows, newest first  ·  -ll adds size + date  ·  -s size|name|path|ext  ·  -a
 facet -c ext:md                        count only (37 ms for the whole disk)
 facet -j ...                           JSON for agents: the report, rows with -l, the count with -c
+facet --grep join ext:md dm:last7days  contains: keep only files whose CONTENTS hold the phrase (everywhere runs over the
+                                       result set); the report shows where those files live, rows carry a matches count
 facet --gui [query]                    the window: click a facet to drill in, right-click to exclude  ·  facetw.exe = no console
 facet --shortcut                       put "facet" in the Start Menu (type facet in Start, pin it from there) · --shortcut desktop
 facet --mcp                            MCP stdio server — tools: facet_query, facet_list, facet_count
@@ -105,6 +107,12 @@ QUERY  ext:md dm:last3days
 
 - **Query box** — Everything syntax, verbatim; the search re-runs as you type (260 ms after the
   last key), Enter runs it now.
+- **Contains box** (Ctrl+K) — a phrase; `everywhere` scans the current result set's files for it
+  and only the files that hold it stay: the rail shows where *those* live, the table gains a
+  **Hits** column (matching lines per file, sortable), the tally reads "57 of 1,255 files contain
+  it · 3.2 s", and Ctrl+Shift+C copies the equivalent shell pipeline. Literal and case-insensitive;
+  the CLI's `--grep-regex` / `--grep-case` apply when the window is started with them. Above
+  `--scan-max` files (1,000,000) it refuses and asks you to narrow the query first.
 - **Facet rail** — the report's sections, live. Left-click a directory, extension, bucket or
   burst to keep only it; right-click to exclude it (*(files right here)* rows select the files
   directly inside a folder, through Everything's `parent:`). Each pick becomes a **chip**; the chips
@@ -205,6 +213,18 @@ the icon, the shortcut) · `facet.ico` (exported by `facet --make-icon`, embedde
 - *in the future* and *no date* buckets have no query term; Everything 1.4 has no `dm:` form
   for "unknown".
 - Windows only, by construction — the whole point is the WDDM-era MFT index Everything keeps.
+
+## Contains: everywhere inside facet
+
+`--grep PHRASE` (window: the contains box) runs the whole names → contents → where pipeline in
+one pass: Everything narrows by name and date, every file of the result set is handed to
+`everywhere.exe` on a pipe, and only the hits are folded — with a matches count per file. The
+report says `contains "join": 52 of 382,529 files, 118 matches · everywhere 4.1 s` and prints
+the shell form it is equivalent to; `-j` carries the same under `grep`, `-l` / `-ll` rows carry
+`matches`, `--paths --grep` prints only the hits, `-c --grep` counts them. facet finds
+`everywhere.exe` next to itself, in `C:\everywhere\build\Release`, in Program Files or on PATH
+(`--everywhere-exe PATH` / `FACET_EVERYWHERE` otherwise) and explains what is missing when none
+exists; everything else keeps working without it.
 
 ## Tapes: the pipe between everything, everywhere and everywhen
 

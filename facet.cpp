@@ -8,7 +8,9 @@
 #include "es_client.h"
 #include "everything_ipc.h"
 #include "facets.h"
+#include "pass.h"
 #include "query.h"
+#include "scan.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -331,7 +333,7 @@ static std::vector<Filter> filters_from(const Opts& o) {
 
 // Every mode reaches Everything the same way: start it when it is only not running (unless
 // --no-start), point at a specific exe when told, and put the notes on stderr.
-static void configure(Everything& es, const Opts& o) {
+void configure(Everything& es, const Opts& o) {
     es.launch.allow_start = !o.no_start;
     es.launch.exe_override = o.everything_exe;
     es.on_note = [](const std::string& n) { fprintf(stderr, "facet: %s\n", n.c_str()); };
@@ -342,11 +344,7 @@ static void configure(Everything& es, const Opts& o) {
 // A tape is one path per line (LF or CRLF; a NUL-separated list is detected), or JSONL whose
 // objects carry "path" or "file". Comments (#), blanks and duplicates are dropped; order kept.
 // ======================================================================
-struct Tape {
-    std::vector<std::wstring> paths;   // unique, backslashed, no trailing separator
-    size_t records = 0, dups = 0, bad = 0;
-    bool nul = false;
-};
+// (struct Tape lives in pass.h — the window shares it)
 
 // the identity of a path in a set: case-folded, backslashed, no \\?\ prefix, no trailing separator
 static std::wstring norm_key(std::wstring p) {
@@ -476,13 +474,21 @@ static bool stat_item(const std::wstring& p, std::wstring& name, std::wstring& d
     return true;
 }
 
-// Every full path of the base set (a tape, or an Everything query) after the tape ops, in order.
-// Streams: nothing is retained, so the whole disk fits.
+// Every full path of the base set (a tape, or an Everything query) after the tape ops, in order;
+// with --grep, only the paths everywhere finds the phrase in. Streams: nothing is retained.
 static bool walk_paths(const Opts& o, const std::function<void(const std::wstring&)>& emit, std::wstring& compiled, std::string& err) {
     TapeOps ops;
     if (!load_ops(o, ops, &err)) return false;
     const bool track = !ops.or_paths.empty();
     std::unordered_set<std::wstring> base_keys;
+    const bool grep = !o.grep.empty();
+    ContentScan scan;
+    if (grep) {
+        const std::wstring ew = find_everywhere_exe(o.everywhere_exe);
+        if (ew.empty()) { err = everywhere_install_hint(); return false; }
+        if (!scan.start(ew, o.grep, !o.grep_regex, !o.grep_case, &err)) return false;
+    }
+    auto out = [&](const std::wstring& p) { if (grep) scan.feed(p); else emit(p); };
     uint64_t n = 0;
     if (!o.files_from.empty()) {
         Tape t;
@@ -491,7 +497,7 @@ static bool walk_paths(const Opts& o, const std::function<void(const std::wstrin
             const std::wstring key = norm_key(p);
             if (!ops.pass(key)) continue;
             if (track) base_keys.insert(key);
-            emit(p);
+            out(p);
             if (o.max_rows && ++n >= o.max_rows) break;
         }
     } else {
@@ -500,8 +506,15 @@ static bool walk_paths(const Opts& o, const std::function<void(const std::wstrin
         compiled = compile(o.query, filters_from(o));
         const uint32_t sort = o.sort_set ? ipc_sort(o.sort, o.ascending) : (uint32_t)ipc::NameAsc;
         std::wstring full;
+        bool capped = false;
         const bool ok = es.query(compiled, sort, 0, o.max_rows, o.page, ipc::kReqName | ipc::kReqPath,
-                                 [&](const EsPage&, const EsItem* it, uint32_t k) {
+                                 [&](const EsPage& pg, const EsItem* it, uint32_t k) {
+                                     if (grep && pg.total > o.scan_max) {
+                                         err = ssprintf("%s files match the query - more than --scan-max %s; narrow the query before a content scan",
+                                                        fmt_count(pg.total).c_str(), fmt_count(o.scan_max).c_str());
+                                         capped = true;
+                                         return false;
+                                     }
                                      for (uint32_t i = 0; i < k; ++i) {
                                          full.assign(it[i].path, it[i].path_len);
                                          full += L'\\';
@@ -511,48 +524,80 @@ static bool walk_paths(const Opts& o, const std::function<void(const std::wstrin
                                              if (!ops.pass(key)) continue;
                                              if (track) base_keys.insert(key);
                                          }
-                                         emit(full);
+                                         if (grep && it[i].folder) continue;
+                                         out(full);
                                      }
                                      return true;
                                  }, &err);
-        if (!ok) return false;
+        if (!ok || capped) { scan.kill(); return false; }
     }
     for (const auto& p : ops.or_paths) {
         const std::wstring key = norm_key(p);
         if (base_keys.count(key) || ops.not_keys.count(key)) continue;
-        emit(p);
+        out(p);
+    }
+    if (grep) {
+        if (!o.quiet && stderr_is_console()) fprintf(stderr, "  facet: everywhere is scanning %s files for \"%s\"...\n", fmt_count(scan.fed()).c_str(), narrow(o.grep).c_str());
+        ScanResult sr = scan.finish({});
+        if (!sr.ok) { err = sr.err; return false; }
+        for (const auto& h : sr.hits) emit(h.path);
     }
     return true;
 }
 
-// ======================================================================
-// the pass: compile → stream → fold   (or: tape → stat → fold)
-// ======================================================================
-struct Run {
-    std::wstring compiled;
-    EsInfo info;
-    double ms = 0;
-    std::string err;
-    uint32_t total = 0;      // Everything's match count for the compiled query (after tape ops: the fold's count)
-    std::string source = "everything";   // or "tape"
-    std::string spec;        // the tape's name
-    size_t tape_paths = 0, tape_missing = 0, tape_records = 0, tape_dups = 0, tape_bad = 0;
-    bool ops_active = false;
-};
+std::wstring pipeline_text(const std::wstring& compiled, const std::wstring& grep, bool literal, bool icase) {
+    std::wstring s = L"facet --paths " + quote_arg(compiled.empty() ? std::wstring(L"\"\"") : compiled);
+    if (compiled.empty()) s = L"facet --paths \"\"";
+    s += L" | everywhere --files-from -";
+    if (literal) s += L" -F";
+    if (icase) s += L" -i";
+    s += L" -e " + quote_arg(grep) + L" -l | facet --files-from -";
+    return s;
+}
 
-static bool run_pass(const Opts& o, Everything& es, Facets& f, Run& r, const Tape* inline_tape = nullptr) {
+// ======================================================================
+// the pass: compile → stream → [everywhere] → fold   (or: tape → [everywhere] → stat → fold)
+// (struct Run and PassHooks live in pass.h — the window runs the same pass on its worker thread)
+// ======================================================================
+bool run_pass(const Opts& o, Everything& es, Facets& f, Run& r, const Tape* inline_tape, const PassHooks* hooks) {
     const double t0 = now_ms();
     TapeOps ops;
     if (!load_ops(o, ops, &r.err)) return false;
     r.ops_active = ops.active();
     const bool track = !ops.or_paths.empty();
     std::unordered_set<std::wstring> base_keys;
-    auto fold_path = [&](const std::wstring& p) {
+    auto cancelled = [&]() { return hooks && hooks->cancelled && hooks->cancelled(); };
+    auto progress = [&](const char* phase, uint64_t done, uint64_t total) {
+        if (hooks && hooks->progress) hooks->progress(phase, done, total);
+    };
+    const bool console_progress = !o.quiet && !hooks && stderr_is_console();
+
+    // "contains": every file the base pass yields goes to everywhere; only the hits are folded
+    const bool grep = !o.grep.empty();
+    ContentScan scan;
+    if (grep) {
+        const std::wstring ew = find_everywhere_exe(o.everywhere_exe);
+        if (ew.empty()) { r.err = everywhere_install_hint(); return false; }
+        if (!scan.start(ew, o.grep, !o.grep_regex, !o.grep_case, &r.err)) return false;
+        r.grep = o.grep;
+        r.everywhere_exe = narrow(ew);
+    }
+    auto fold_path = [&](const std::wstring& p, uint32_t matches) {
         std::wstring name, dir;
         EsItem it;
         if (!stat_item(p, name, dir, it)) r.tape_missing++;
+        it.matches = matches;
         f.add(it);
-        r.tape_paths++;
+    };
+    auto take = [&](const std::wstring& full, const EsItem* it) {   // one base item: fold it, or hand it to everywhere
+        if (grep) {
+            if (it && it->folder) return;
+            scan.feed(full);
+            r.scanned_files++;
+            return;
+        }
+        if (it) f.add(*it);
+        else fold_path(full, 0);
     };
     bool ok = true;
     if (inline_tape || !o.files_from.empty()) {
@@ -571,51 +616,88 @@ static bool run_pass(const Opts& o, Everything& es, Facets& f, Run& r, const Tap
             const std::wstring key = norm_key(p);
             if (!ops.pass(key)) continue;
             if (track) base_keys.insert(key);
-            fold_path(p);
-            if (o.max_rows && f.items >= o.max_rows) break;
+            take(p, nullptr);
+            r.tape_paths++;
+            if (o.max_rows && r.tape_paths >= o.max_rows) break;
         }
     } else {
-        r.compiled = compile(o.query, filters_from(o));
+        if (r.compiled.empty()) r.compiled = compile(o.query, filters_from(o));
         const uint32_t req = ipc::kReqName | ipc::kReqPath | ipc::kReqSize | ipc::kReqModified;
         // rows retained → the caller's order matters; facets only → the index's own order is cheapest
         const uint32_t sort = f.config().keep_rows ? ipc_sort(o.sort, o.ascending) : (uint32_t)ipc::NameAsc;
-        const bool progress = !o.quiet && stderr_is_console();
         ULONGLONG last = GetTickCount64();
         bool shown = false;
         std::wstring full;
         auto sink = [&](const EsPage& pg, const EsItem* items, uint32_t n) -> bool {
             r.total = pg.total;
+            if (grep && pg.total > o.scan_max) {
+                r.scan_capped = true;
+                r.err = ssprintf("%s files match the query - more than --scan-max %s; narrow the query before a content scan",
+                                 fmt_count(pg.total).c_str(), fmt_count(o.scan_max).c_str());
+                return false;
+            }
             for (uint32_t i = 0; i < n; ++i) {
-                if (ops.active()) {
+                if (ops.active() || grep) {
                     full.assign(items[i].path, items[i].path_len);
                     full += L'\\';
                     full.append(items[i].name, items[i].name_len);
+                }
+                if (ops.active()) {
                     const std::wstring key = norm_key(full);
                     if (!ops.pass(key)) continue;
                     if (track) base_keys.insert(key);
                 }
-                f.add(items[i]);
+                take(full, &items[i]);
             }
-            if (progress) {
+            progress("everything", grep ? r.scanned_files : f.items, pg.total);
+            if (console_progress) {
                 const ULONGLONG now = GetTickCount64();
                 if (now - last > 700) {
-                    fprintf(stderr, "\r  facet: %s of %s items...", fmt_count(f.items).c_str(), fmt_count(pg.total).c_str());
+                    fprintf(stderr, "\r  facet: %s of %s items...", fmt_count(grep ? r.scanned_files : f.items).c_str(), fmt_count(pg.total).c_str());
                     shown = true;
                     last = now;
                 }
             }
-            return true;
+            return !cancelled();
         };
         ok = es.query(r.compiled, sort, 0, o.max_rows, o.page, req, sink, &r.err);
         if (shown) fputs("\r                                                      \r", stderr);
         r.info = es.info();
+        if (r.scan_capped) ok = false;
+        if (ok && cancelled()) { r.err = "cancelled"; ok = false; }
     }
-    for (const auto& p : ops.or_paths) {
-        const std::wstring key = norm_key(p);
-        if (base_keys.count(key) || ops.not_keys.count(key)) continue;
-        fold_path(p);
+    if (ok) {
+        for (const auto& p : ops.or_paths) {
+            const std::wstring key = norm_key(p);
+            if (base_keys.count(key) || ops.not_keys.count(key)) continue;
+            take(p, nullptr);
+            r.tape_paths++;
+        }
     }
-    if (r.source == "tape" || ops.active()) r.total = (uint32_t)std::min<uint64_t>(f.items, 0xFFFFFFFFu);
+    if (grep) {
+        if (!ok) {
+            scan.kill();
+        } else {
+            progress("everywhere", r.scanned_files, r.scanned_files);
+            if (console_progress) fprintf(stderr, "\r  facet: everywhere is scanning %s files for \"%s\"...", fmt_count(r.scanned_files).c_str(), narrow(o.grep).c_str());
+            ScanResult sr = scan.finish(hooks ? hooks->cancelled : std::function<bool()>());
+            if (console_progress) fputs("\r                                                                                \r", stderr);
+            r.scan_ms = sr.ms;
+            if (!sr.ok) {
+                r.err = sr.err;
+                ok = false;
+            } else {
+                r.hit_files = sr.hits.size();
+                r.matches = sr.matches;
+                progress("fold", 0, r.hit_files);
+                for (const auto& h : sr.hits) fold_path(h.path, h.count);
+                r.total = (uint32_t)std::min<uint64_t>(f.items, 0xFFFFFFFFu);
+                f.sort_rows(o.sort, o.ascending);   // hits arrive in everywhere's order
+            }
+        }
+    } else if (r.source == "tape" || ops.active()) {
+        r.total = (uint32_t)std::min<uint64_t>(f.items, 0xFFFFFFFFu);
+    }
     f.finish();
     r.ms = now_ms() - t0;
     return ok;
@@ -804,6 +886,13 @@ static std::string render_report(const Facets& f, const Opts& o, const Run& r, c
     }
     out += R;
     out += "\n";
+    if (!r.grep.empty()) {
+        out += ansi ? clr::amb : "";
+        out += ssprintf("contains \"%s\": %s of %s files, %s matches · everywhere %.1f s", narrow(r.grep).c_str(), fmt_count(r.hit_files).c_str(),
+                        fmt_count(r.scanned_files).c_str(), fmt_count(r.matches).c_str(), r.scan_ms / 1000.0);
+        out += R;
+        out += "\n";
+    }
     if (r.total > f.items) {
         out += ansi ? clr::amb : "";
         out += ssprintf("  facets cover the first %s of %s matches (raise --max)\n", fmt_count(f.items).c_str(), fmt_count(r.total).c_str());
@@ -827,7 +916,13 @@ static std::string render_report(const Facets& f, const Opts& o, const Run& r, c
     out += R;
     out += "  " + (r.source == "tape" ? r.spec : narrow(r.compiled));
     for (const auto& [op, spec] : o.tape_ops) out += std::string(op == '&' ? "  ∩ " : op == '|' ? "  ∪ " : "  − ") + spec;
+    if (!r.grep.empty()) out += "  ·  contains \"" + narrow(r.grep) + "\"";
     out += "\n";
+    if (!r.grep.empty()) {
+        out += D;
+        out += "       " + narrow(pipeline_text(r.compiled, r.grep, !o.grep_regex, !o.grep_case)) + "\n";
+        out += R;
+    }
     out += D;
     out += r.source == "tape" ? "       --paths prints a result set as a tape · --and / --or / --not F combine tapes · everywhere --files-from - scans one"
                               : "       -x DIR excludes a subtree · -i DIR drills in · -e md;txt · --since 3d · --flat 2 · -l rows · -j JSON · --paths for pipes";
@@ -886,6 +981,11 @@ static std::string report_json(const Facets& f, const Opts& o, const Run& r) {
         j += std::string("{\"op\":\"") + (o.tape_ops[i].first == '&' ? "and" : o.tape_ops[i].first == '|' ? "or" : "not") + "\",\"file\":" + jstr(o.tape_ops[i].second) + "}";
     }
     j += "]";
+    if (r.grep.empty()) j += ",\"grep\":null";
+    else
+        j += ",\"grep\":{\"phrase\":" + jw(r.grep) + ",\"files_scanned\":" + jn(r.scanned_files) + ",\"files_hit\":" + jn(r.hit_files) +
+             ",\"matches\":" + jn(r.matches) + ",\"everywhere\":" + jstr(r.everywhere_exe) + ssprintf(",\"ms\":%.0f", r.scan_ms) +
+             ",\"pipeline\":" + jw(pipeline_text(r.compiled, r.grep, !o.grep_regex, !o.grep_case)) + "}";
     const uint64_t thr = fold_threshold(o, f.items);
     j += ",\"directories\":[";
     if (o.flat) {
@@ -1022,17 +1122,23 @@ static int run_list(Opts o) {
             if (i) j += ",";
             j += "{\"path\":" + jw(f.row_path(rw)) + ",\"name\":" + jw(f.row_name(rw)) + ",\"dir\":" + jw(f.dir_path(rw.dir)) +
                  ",\"size\":" + jopt(rw.size) + ",\"modified\":" + (rw.mtime == kUnknown64 ? std::string("null") : jstr(fmt_filetime_iso(rw.mtime))) +
-                 ",\"folder\":" + (rw.folder ? "true" : "false") + "}";
+                 ",\"folder\":" + (rw.folder ? "true" : "false") + (r.grep.empty() ? std::string() : ",\"matches\":" + jn(rw.matches)) + "}";
         }
-        j += "]}\n";
+        j += "]";
+        if (!r.grep.empty())
+            j += ",\"grep\":{\"phrase\":" + jw(r.grep) + ",\"files_scanned\":" + jn(r.scanned_files) + ",\"files_hit\":" + jn(r.hit_files) +
+                 ",\"matches\":" + jn(r.matches) + ssprintf(",\"ms\":%.0f}", r.scan_ms);
+        j += "}\n";
         write_out(j);
         return 0;
     }
     std::string out;
     out.reserve(f.rows.size() * 96);
     for (const Row& rw : f.rows) {
-        if (o.long_list)
+        if (o.long_list) {
+            if (!r.grep.empty()) out += rpad_display(fmt_count(rw.matches), 6) + "  ";
             out += rpad_display(rw.folder ? "<dir>" : human_bytes(rw.size), 9) + "  " + pad_display(fmt_filetime(rw.mtime, false), 16) + "  ";
+        }
         out += narrow(f.row_path(rw)) + "\n";
     }
     write_out(out);
@@ -1063,7 +1169,7 @@ static int run_paths(const Opts& o) {
 }
 
 static int run_count(const Opts& o) {
-    if (!o.files_from.empty() || !o.tape_ops.empty()) {   // a tape, or a query combined with tapes: count what walks
+    if (!o.files_from.empty() || !o.tape_ops.empty() || !o.grep.empty()) {   // a tape, tape ops, or a scan: count what walks
         uint64_t n = 0;
         std::wstring compiled;
         std::string err;
@@ -1162,7 +1268,13 @@ static const char* kToolsList =
     "\"bursts\":{\"type\":\"integer\",\"default\":10},"
     "\"max\":{\"type\":\"integer\",\"default\":0,\"description\":\"scan at most this many items (0 = all)\"},"
     "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"fold these full paths instead of running query "
-    "(a tape, e.g. the files another tool found); query is ignored, missing files are counted\"}"
+    "(a tape, e.g. the files another tool found); query is ignored, missing files are counted\"},"
+    "\"grep\":{\"type\":\"string\",\"description\":\"keep only files whose CONTENTS contain this phrase (everywhere, the GPU grep, "
+    "runs over the result set; literal and case-insensitive by default); the report then shows where those files live and a "
+    "matches count per file\"},"
+    "\"grep_case\":{\"type\":\"boolean\",\"default\":false},"
+    "\"grep_regex\":{\"type\":\"boolean\",\"default\":false,\"description\":\"treat grep as a regex\"},"
+    "\"scan_max\":{\"type\":\"integer\",\"default\":1000000,\"description\":\"refuse to scan more files than this\"}"
     "},\"required\":[\"query\"]}},{"
     "\"name\":\"facet_list\","
     "\"description\":\"Rows of an Everything search (full path, size, modified, folder flag), sorted by "
@@ -1174,8 +1286,9 @@ static const char* kToolsList =
     "\"include\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
     "\"ext\":{\"type\":\"string\"},"
     "\"since\":{\"type\":\"string\"},"
-    "\"sort\":{\"type\":\"string\",\"enum\":[\"modified\",\"name\",\"path\",\"size\",\"ext\"],\"default\":\"modified\"},"
+    "\"sort\":{\"type\":\"string\",\"enum\":[\"modified\",\"name\",\"path\",\"size\",\"ext\",\"hits\"],\"default\":\"modified\"},"
     "\"ascending\":{\"type\":\"boolean\",\"default\":false},"
+    "\"grep\":{\"type\":\"string\",\"description\":\"keep only files whose contents contain this phrase; rows gain a matches count\"},"
     "\"max\":{\"type\":\"integer\",\"default\":100,\"maximum\":10000}"
     "},\"required\":[\"query\"]}},{"
     "\"name\":\"facet_count\","
@@ -1201,6 +1314,10 @@ static void mcp_common_opts(const JV* a, Opts& o) {
     const std::wstring e = str("ext");
     if (!e.empty()) o.ext.push_back(e);
     o.since = str("since");
+    o.grep = str("grep");
+    o.grep_case = a && a->get("grep_case") ? a->get("grep_case")->as_bool(false) : false;
+    o.grep_regex = a && a->get("grep_regex") ? a->get("grep_regex")->as_bool(false) : false;
+    if (a && a->get("scan_max")) o.scan_max = (uint64_t)std::clamp(a->get("scan_max")->as_num(1e6), 1.0, 1e9);
     o.quiet = true;
     o.json = true;
 }
@@ -1289,9 +1406,11 @@ static int run_mcp(const Opts& base) {
                     if (i) j += ",";
                     j += "{\"path\":" + jw(f.row_path(rw)) + ",\"size\":" + jopt(rw.size) + ",\"modified\":" +
                          (rw.mtime == kUnknown64 ? std::string("null") : jstr(fmt_filetime_iso(rw.mtime))) +
-                         ",\"folder\":" + (rw.folder ? "true" : "false") + "}";
+                         ",\"folder\":" + (rw.folder ? "true" : "false") + (r.grep.empty() ? std::string() : ",\"matches\":" + jn(rw.matches)) + "}";
                 }
-                j += "]}";
+                j += "]";
+                if (!r.grep.empty()) j += ",\"grep\":{\"phrase\":" + jw(r.grep) + ",\"files_scanned\":" + jn(r.scanned_files) + ",\"files_hit\":" + jn(r.hit_files) + ",\"matches\":" + jn(r.matches) + "}";
+                j += "}";
                 mcp_result(id, mcp_text(j));
             } else if (tool == "facet_count") {
                 const std::wstring compiled = compile(o.query, filters_from(o));
@@ -1494,6 +1613,54 @@ static int run_selftest(const Opts& opts) {
         check(stat_item(L"C:\\facet\\docs", name, dir, it) && it.folder && it.size == kUnknown64, "stat_item: a folder");
     }
 
+    // ---- everywhere: the content scan
+    {
+        check(quote_arg(L"plain") == L"plain" && quote_arg(L"two words") == L"\"two words\"" && quote_arg(L"say \"hi\"") == L"\"say \\\"hi\\\"\"" &&
+                  quote_arg(L"C:\\dir\\") == L"C:\\dir\\" && quote_arg(L"a b\\") == L"\"a b\\\\\"",
+              "quote_arg: spaces, quotes, trailing backslashes");
+        const std::wstring ew = find_everywhere_exe(opts.everywhere_exe);
+        if (ew.empty()) {
+            printf("  info: everywhere not found - content scan checks skipped\n");
+        } else {
+            printf("  info: everywhere at %s\n", narrow(ew).c_str());
+            ContentScan sc;
+            std::string err;
+            const bool started = sc.start(ew, L"facet", true, true, &err);
+            check(started, started ? "everywhere starts" : "everywhere: " + err);
+            if (started) {
+                sc.feed(L"C:\\facet\\README.md");
+                sc.feed(L"C:\\facet\\docs\\devlog.md");
+                sc.feed(L"C:\\facet\\LICENSE");
+                sc.feed(L"C:\\facet\\no-such-file.md");
+                const ScanResult sr = sc.finish({});
+                check(sr.ok && sr.fed == 4 && sr.hits.size() == 2 && sr.matches >= 2,
+                      ssprintf("scan: 4 fed, %zu hit, %s matches, exit %d, %.0f ms", sr.hits.size(), fmt_count(sr.matches).c_str(), sr.exit_code, sr.ms));
+                bool spelled = true;
+                for (const auto& h : sr.hits)
+                    if (h.path.find(L'/') != std::wstring::npos || h.count == 0) spelled = false;
+                check(spelled, "scan hits: backslashed paths with counts");
+            }
+            // the pass with --grep over a tape: only the hits are folded, with their counts
+            Opts go = opts;
+            go.grep = L"facet";
+            go.quiet = true;
+            Tape gt;
+            gt.paths = { L"C:\\facet\\README.md", L"C:\\facet\\docs\\devlog.md", L"C:\\facet\\LICENSE" };
+            FacetConfig gc;
+            gc.keep_rows = 10;
+            gc.top_bursts = 1;
+            Facets gf(gc);
+            Everything ges;
+            Run gr;
+            const bool gok = run_pass(go, ges, gf, gr, &gt, nullptr);
+            check(gok && gf.items == 2 && gr.scanned_files == 3 && gr.hit_files == 2 && gr.matches >= 2 && gf.rows.size() == 2 && gf.rows[0].matches > 0,
+                  ssprintf("pass --grep over a tape: %llu of %llu files folded, %llu matches", (unsigned long long)gr.hit_files,
+                           (unsigned long long)gr.scanned_files, (unsigned long long)gr.matches));
+            check(pipeline_text(L"ext:md dm:today", L"join", true, true) == L"facet --paths \"ext:md dm:today\" | everywhere --files-from - -F -i -e join -l | facet --files-from -",
+                  "pipeline_text");
+        }
+    }
+
     // ---- finding Everything
     {
         const std::wstring exe = find_everything_exe(opts.everything_exe);
@@ -1600,7 +1767,7 @@ static int run_selftest(const Opts& opts) {
                 tc.top_bursts = 1;
                 Facets tf(tc);
                 Run tr;
-                const bool fold_ok = run_pass(o, es, tf, tr, &tt);   // run first: the message below reads the numbers
+                const bool fold_ok = run_pass(o, es, tf, tr, &tt, nullptr);   // run first: the message below reads the numbers
                 check(fold_ok && tf.items == tt.paths.size() && tr.source == "tape" && tr.total == tt.paths.size(),
                       ssprintf("tape fold: %llu of %zu paths, %zu missing", (unsigned long long)tf.items, tt.paths.size(), tr.tape_missing));
             }
@@ -1651,6 +1818,7 @@ SHAPE
   --no-start           never start Everything (by default facet finds Everything.exe and starts
                        it tray-only when no instance is running, then waits for the database)
   --everything-exe P   the Everything.exe to use (or FACET_EVERYTHING=P) — portable installs
+  --no-activate        open the window without taking the keyboard (scripted / driver runs)
   --ini P              the window's settings file: standing excludes + placement (default facet.ini
                        next to the exe) — a second profile, or a scratch one for tests
   -h, --help           this text                  -v  version
@@ -1668,6 +1836,14 @@ TAPES (paths in, paths out — the pipe contract facet shares with everywhere an
   --and F  --or F  --not F   set algebra over tapes: (base ∩ and…) ∪ or… − not…   (repeatable)
   -0, --null           NUL-separated paths out (input is auto-detected)
   facet --paths -x C:\vendor ext:md dm:last7days | everywhere --files-from - -e join -l | facet --files-from -
+
+CONTAINS (everywhere, the GPU content grep, over the result set — that pipe in one command)
+  --grep PHRASE        keep only files whose contents contain PHRASE; the report shows where those
+                       files live, -l / -j rows carry a matches count, --paths prints only the hits
+  --grep-case          case-sensitive (default: not)     --grep-regex   PHRASE is a regex (default: literal)
+  --scan-max N         refuse to hand more than N files to everywhere (default 1,000,000): narrow first
+  --everywhere-exe P   the everywhere.exe to run (or FACET_EVERYWHERE=P); found in C:\everywhere otherwise
+  facet --grep join ext:md dm:last7days     ==   facet --paths ... | everywhere --files-from - -F -i -e join -l | facet --files-from -
 
 READING THE REPORT
   DIRECTORIES  where the matches live, ranked; a chain like C:\Users\user\ collapses when it
@@ -1724,6 +1900,11 @@ int app_main(int argc, wchar_t** argv) {
         else if (a == "--and") o.tape_ops.emplace_back('&', narrow(need_str(argc, argv, i, "--and")));
         else if (a == "--or") o.tape_ops.emplace_back('|', narrow(need_str(argc, argv, i, "--or")));
         else if (a == "--not") o.tape_ops.emplace_back('-', narrow(need_str(argc, argv, i, "--not")));
+        else if (a == "--grep" || a == "--contains" || a == "-g") o.grep = need_str(argc, argv, i, "--grep");
+        else if (a == "--grep-case") o.grep_case = true;
+        else if (a == "--grep-regex") o.grep_regex = true;
+        else if (a == "--scan-max") o.scan_max = (uint64_t)std::clamp(need_num(argc, argv, i, "--scan-max"), 1L, 2000000000L);
+        else if (a == "--everywhere-exe") o.everywhere_exe = need_str(argc, argv, i, "--everywhere-exe");
         else if (a == "-j" || a == "--json") o.json = true;
         else if (a == "--gui") o.mode = Opts::Mode::Gui;
         else if (a == "--mcp") o.mode = Opts::Mode::Mcp;
@@ -1766,6 +1947,7 @@ int app_main(int argc, wchar_t** argv) {
         else if (a == "-q" || a == "--quiet") o.quiet = true;
         else if (a == "--page") o.page = (uint32_t)std::clamp(need_num(argc, argv, i, "--page"), 64L, 1048576L);
         else if (a == "--shot") o.shot = narrow(need_str(argc, argv, i, "--shot"));
+        else if (a == "--no-activate") o.no_activate = true;
         else {
             fprintf(stderr, "facet: unknown option '%s' (try --help)\n", a.c_str());
             return 1;

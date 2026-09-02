@@ -12,12 +12,12 @@
 
 namespace facet {
 
-constexpr const char* kVersion = "0.3.0";
+constexpr const char* kVersion = "0.4.0";
 constexpr uint64_t kUnknown64 = ~0ull;             // "not reported" — never confuse with 0
 constexpr uint64_t kTicksPerSec = 10000000ull;     // FILETIME resolution
 constexpr uint64_t kTicksPerDay = 864000000000ull;
 
-enum class SortKey { Modified, Name, Path, Size, Ext, Created, Recent };
+enum class SortKey { Modified, Name, Path, Size, Ext, Created, Recent, Hits };
 
 struct Opts {
     enum class Mode { Auto, Report, List, Count, Paths, Gui, Mcp, Selftest, Where, MakeIcon, Shortcut, Help, Version };
@@ -47,10 +47,17 @@ struct Opts {
     bool nul = false;                      // -0: NUL-separated paths out (input auto-detects)
     std::string files_from;                // --files-from FILE|-: fold this path list instead of a query
     std::vector<std::pair<char, std::string>> tape_ops;   // ('&' --and F) ('|' --or F) ('-' --not F), in order
+    // "contains": everywhere over the result set
+    std::wstring grep;                     // --grep PHRASE: keep only files whose contents match
+    bool grep_case = false;                // --grep-case: case-sensitive (default: -i)
+    bool grep_regex = false;               // --grep-regex: PHRASE is a regex (default: -F literal)
+    std::wstring everywhere_exe;           // --everywhere-exe PATH (or FACET_EVERYWHERE)
+    uint64_t scan_max = 1000000;           // --scan-max N: refuse to hand more files than this to everywhere
     bool plain = false;                    // no ANSI
     bool quiet = false;                    // no progress on stderr
     uint32_t page = 65536;                 // IPC page size
     std::string shot;                      // --gui --shot FILE.png: render once, save, exit
+    bool no_activate = false;              // --no-activate: open the window without taking focus (scripted runs)
     bool no_start = false;                 // never launch Everything ourselves
     std::wstring everything_exe;           // --everything-exe PATH (or FACET_EVERYTHING)
     std::string out_file;                  // --make-icon FILE.ico · --shortcut [startmenu|desktop]
@@ -65,11 +72,13 @@ inline const char* sort_key_name(SortKey k) {
         case SortKey::Ext: return "ext";
         case SortKey::Created: return "created";
         case SortKey::Recent: return "recent";
+        case SortKey::Hits: return "hits";
         default: return "modified";
     }
 }
 inline bool parse_sort_key(const std::string& s, SortKey& out) {
     if (s == "modified" || s == "date" || s == "dm") out = SortKey::Modified;
+    else if (s == "hits" || s == "matches") out = SortKey::Hits;
     else if (s == "name") out = SortKey::Name;
     else if (s == "path") out = SortKey::Path;
     else if (s == "size") out = SortKey::Size;

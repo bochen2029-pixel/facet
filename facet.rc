@@ -4,8 +4,8 @@
 1 ICON "facet.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,3,0,0
- PRODUCTVERSION 0,3,0,0
+ FILEVERSION 0,4,0,0
+ PRODUCTVERSION 0,4,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS VOS_NT_WINDOWS32
@@ -18,12 +18,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "Bo Chen"
       VALUE "FileDescription", "facet - pivot filtering over Everything's index"
-      VALUE "FileVersion", "0.3.0"
+      VALUE "FileVersion", "0.4.0"
       VALUE "InternalName", "facet"
       VALUE "LegalCopyright", "MIT (c) 2026 Bo Chen"
       VALUE "OriginalFilename", "facet.exe"
       VALUE "ProductName", "facet"
-      VALUE "ProductVersion", "0.3.0"
+      VALUE "ProductVersion", "0.4.0"
     END
   END
   BLOCK "VarFileInfo"

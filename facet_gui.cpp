@@ -9,7 +9,11 @@
 #include "es_client.h"
 #include "everything_ipc.h"
 #include "facets.h"
+#include "pass.h"
 #include "query.h"
+#include "scan.h"
+
+#include <cstring>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -91,6 +95,7 @@ struct Result {                 // built by the worker, owned by the UI once del
     double ms = 0;
     std::string err;
     EsInfo info;
+    Run run;                    // the whole pass record: tape stats, the scan's numbers
 };
 
 struct Request {
@@ -98,6 +103,7 @@ struct Request {
     std::wstring compiled;
     SortKey sort = SortKey::Modified;
     bool ascending = false;
+    std::wstring grep;          // "contains": everywhere over the result set
 };
 
 struct Scroll {                 // a region's vertical scroll state + its drawn scrollbar
@@ -108,7 +114,7 @@ struct Scroll {                 // a region's vertical scroll state + its drawn 
 
 struct Gui {
     Opts opts;
-    HWND hwnd = nullptr, edit = nullptr;
+    HWND hwnd = nullptr, edit = nullptr, edit2 = nullptr;   // the query box, the "contains" box
     WNDPROC edit_proc = nullptr;
     HBRUSH edit_brush = nullptr;
     int dpi = 96;
@@ -123,8 +129,10 @@ struct Gui {
     HANDLE thread = nullptr;
     std::atomic<uint32_t> gen{ 0 };
     std::atomic<uint64_t> progress_items{ 0 }, progress_total{ 0 };   // the pass in flight, for the tally
+    std::atomic<int> phase{ 0 };                                       // 0 everything · 1 everywhere · 2 fold
     // state
     std::wstring query;
+    std::wstring grep;          // the contains box
     std::vector<Chip> chips;
     SortKey sort = SortKey::Modified;
     bool ascending = false;
@@ -143,13 +151,14 @@ struct Gui {
     std::wstring status;
     RECT rcTop{}, rcChips{}, rcRail{}, rcHeader{}, rcTable{}, rcStatus{};
     int chip_rows = 1;          // the chips bar grows to hold every chip (up to 5 rows)
-    int col_x[5]{};             // name | path | size | modified | end
+    int col_x[6]{};             // name | path | hits | size | modified | end   (hits has width 0 without a scan)
     int drag = 0;               // 1 rail thumb · 2 table thumb
     int drag_off = 0;
     bool shot_pending = false;
     std::wstring ini;
 };
 Gui* g = nullptr;
+bool scan_active(const Gui& s);   // defined with the sort helpers; layout() needs it first
 
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_NOTE = WM_APP + 2;
@@ -174,8 +183,8 @@ void dbg(const char* fmt, ...) {
     fputc('\n', f);
     fflush(f);
 }
-constexpr UINT_PTR kDebounceTimer = 1, kShotTimer = 2, kProgressTimer = 3;
-constexpr int kEditId = 100;
+constexpr UINT_PTR kDebounceTimer = 1, kShotTimer = 2, kProgressTimer = 3, kDebounce2Timer = 4;
+constexpr int kEditId = 100, kEdit2Id = 101;
 constexpr uint32_t kRowsCap = 200000;
 enum { kMenuOpen = 1, kMenuOpenFolder, kMenuCopyPath, kMenuCopyName, kMenuDrill, kMenuExclude };
 
@@ -193,6 +202,7 @@ void make_fonts(Gui& s) {
     s.fNorm = mk(12, FW_NORMAL);
     s.fSmall = mk(11, FW_NORMAL);
     if (s.edit) SendMessageW(s.edit, WM_SETFONT, (WPARAM)s.fTitle, TRUE);
+    if (s.edit2) SendMessageW(s.edit2, WM_SETFONT, (WPARAM)s.fTitle, TRUE);
 }
 
 // The icon: a facet rail — three bars of falling length. Drawn at runtime for the window and
@@ -347,31 +357,37 @@ DWORD WINAPI worker(LPVOID) {
 
         auto res = std::make_unique<Result>();
         res->gen = r.gen;
-        res->compiled = r.compiled;
         FacetConfig cfg;
         cfg.keep_rows = kRowsCap;
         cfg.top_bursts = (uint32_t)std::max(1, s.opts.bursts);
         cfg.burst_gap_s = (uint32_t)s.opts.burst_gap_s;
         res->f = std::make_unique<Facets>(cfg);
-        const double t0 = now_ms();
-        bool stale = false;
-        const uint32_t req = ipc::kReqName | ipc::kReqPath | ipc::kReqSize | ipc::kReqModified;
         s.progress_items = 0;
         s.progress_total = 0;
-        const bool ok = es.query(r.compiled, ipc_sort(r.sort, r.ascending), 0, s.opts.max_rows, s.opts.page, req,
-                                 [&](const EsPage& pg, const EsItem* it, uint32_t n) {
-                                     res->total = pg.total;
-                                     for (uint32_t i = 0; i < n; ++i) res->f->add(it[i]);
-                                     s.progress_items = res->f->items;
-                                     s.progress_total = pg.total;
-                                     if (s.gen.load() != r.gen) { stale = true; return false; }
-                                     return true;
-                                 }, &res->err);
-        if (stale || s.gen.load() != r.gen) continue;
-        res->f->finish();
-        res->info = es.info();
-        res->ms = now_ms() - t0;
-        if (!ok && res->err.empty()) res->err = "query failed";
+        s.phase = 0;
+        // the same pass the console runs: Everything → [everywhere] → fold, with our cancel + progress hooks
+        Opts po = s.opts;
+        po.sort = r.sort;
+        po.ascending = r.ascending;
+        po.grep = r.grep;
+        po.quiet = true;
+        Run run;
+        run.compiled = r.compiled;
+        PassHooks hooks;
+        hooks.cancelled = [&s, &r]() { return s.gen.load() != r.gen; };
+        hooks.progress = [&s](const char* phase, uint64_t done, uint64_t total) {
+            s.phase = strcmp(phase, "everywhere") == 0 ? 1 : (strcmp(phase, "fold") == 0 ? 2 : 0);
+            s.progress_items = done;
+            s.progress_total = total;
+        };
+        const bool ok = run_pass(po, es, *res->f, run, nullptr, &hooks);
+        if (s.gen.load() != r.gen) continue;   // superseded while it ran
+        res->run = run;
+        res->compiled = run.compiled;
+        res->total = run.total;
+        res->info = run.info;
+        res->ms = run.ms;
+        res->err = ok ? std::string() : (run.err.empty() ? std::string("query failed") : run.err);
         if (s.hwnd) PostMessageW(s.hwnd, WM_APP_RESULT, 0, (LPARAM)res.release());
     }
 }
@@ -392,12 +408,12 @@ void submit(Gui& s) {
     s.compiled = compile(s.query, fs);
     const uint32_t gn = ++s.gen;
     AcquireSRWLockExclusive(&s.lock);
-    s.req = { gn, s.compiled, s.sort, s.ascending };
+    s.req = { gn, s.compiled, s.sort, s.ascending, s.grep };
     s.req_pending = true;
     ReleaseSRWLockExclusive(&s.lock);
     WakeConditionVariable(&s.cv);
     s.busy = true;
-    dbg("submit gen=%u  %s", gn, narrow(s.compiled).c_str());
+    dbg("submit gen=%u  %s%s%s", gn, narrow(s.compiled).c_str(), s.grep.empty() ? "" : "  contains ", narrow(s.grep).c_str());
     SetTimer(s.hwnd, kProgressTimer, 200, nullptr);   // repaint the tally while the pass runs
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
@@ -600,16 +616,23 @@ void layout(Gui& s, RECT client) {
     s.rcTable = rect(s.rcRail.right, s.rcHeader.bottom, client.right, s.rcStatus.top);
     const int tw = s.rcTable.right - s.rcTable.left - px(s, 10);
     const int sizeW = px(s, 84), dateW = px(s, 128);
+    const int hitsW = scan_active(s) ? px(s, 62) : 0;   // the Hits column exists only after a scan
     const int nameW = std::clamp(tw * 3 / 10, px(s, 140), px(s, 420));
     s.col_x[0] = s.rcTable.left + px(s, 8);
     s.col_x[1] = s.col_x[0] + nameW;
-    s.col_x[3] = s.rcTable.right - px(s, 10) - dateW;
-    s.col_x[2] = s.col_x[3] - sizeW;
-    s.col_x[4] = s.rcTable.right - px(s, 10);
+    s.col_x[5] = s.rcTable.right - px(s, 10);
+    s.col_x[4] = s.col_x[5] - dateW;
+    s.col_x[3] = s.col_x[4] - sizeW;
+    s.col_x[2] = s.col_x[3] - hitsW;
     if (s.edit) {
-        const int eh = px(s, 30);
-        MoveWindow(s.edit, s.rcTop.left + px(s, 12), s.rcTop.top + (topH - eh) / 2 + px(s, 4), s.rcTop.right - px(s, 250) - px(s, 12),
-                   eh - px(s, 8), TRUE);
+        // the query box takes what the tally and the contains box leave; the contains box is a third of it
+        const int eh = px(s, 30), y = s.rcTop.top + (topH - eh) / 2 + px(s, 4), h = eh - px(s, 8);
+        const int left = s.rcTop.left + px(s, 12), right = s.rcTop.right - px(s, 250) - px(s, 12);
+        const int label = px(s, 64), gap = px(s, 10);
+        const int w2 = std::clamp((right - left) / 3, px(s, 160), px(s, 520));
+        const int w1 = std::max(px(s, 120), right - left - w2 - label - gap);
+        MoveWindow(s.edit, left, y, w1, h, TRUE);
+        if (s.edit2) MoveWindow(s.edit2, left + w1 + gap + label, y, right - (left + w1 + gap + label), h, TRUE);
     }
 }
 
@@ -656,26 +679,38 @@ void paint(Gui& s, HDC dc, RECT client) {
     const int m = px(s, 10);
     const Facets* f = (s.res && s.res->f) ? s.res->f.get() : nullptr;
 
-    // top bar: the query box (a child control) + the tally
+    // top bar: the query box and the contains box (child controls) + the tally
     fill(dc, s.rcTop, kPanel);
-    if (s.edit) {
+    for (HWND e : { s.edit, s.edit2 }) {
+        if (!e) continue;
         RECT er;
-        GetWindowRect(s.edit, &er);
+        GetWindowRect(e, &er);
         MapWindowPoints(nullptr, s.hwnd, (POINT*)&er, 2);
         InflateRect(&er, px(s, 6), px(s, 4));
         fill(dc, er, kEditBg);
-        frame(dc, er, GetFocus() == s.edit ? kBlu : kTrack);
+        frame(dc, er, GetFocus() == e ? kBlu : kTrack);
+        if (e == s.edit2) {
+            RECT lr = rect(er.left - px(s, 66), er.top, er.left - px(s, 8), er.bottom);
+            draw_text(dc, s.fSmall, kDim, lr, L"contains", DT_RIGHT | DT_VCENTER);
+        }
     }
     {
         std::wstring tally;
+        const bool scanned = f && !s.res->run.grep.empty();
         if (s.busy) {
             const uint64_t done = s.progress_items.load(), tot = s.progress_total.load();
+            const int ph = s.phase.load();
             if (!s.busy_note.empty() && !tot) tally = s.busy_note;
+            else if (ph == 1) tally = L"everywhere: scanning " + widen(fmt_count(done)) + L" files…";
+            else if (ph == 2) tally = L"folding " + widen(fmt_count(tot)) + L" hits…";
             else tally = tot ? L"searching…  " + widen(fmt_count(done)) + L" of " + widen(fmt_count(tot)) : L"searching…";
         } else if (s.res && !s.res->err.empty()) tally = L"! " + widen(s.res->err);
+        else if (scanned)
+            tally = widen(fmt_count(s.res->run.hit_files)) + L" of " + widen(fmt_count(s.res->run.scanned_files)) + L" files contain it · " +
+                    widen(ssprintf("%.1f s", s.res->run.scan_ms / 1000.0));
         else if (f) tally = widen(fmt_count(s.res->total)) + L" items · " + widen(ssprintf("%.0f ms", s.res->ms));
         RECT tr = rect(s.rcTop.right - px(s, 250), s.rcTop.top, s.rcTop.right - m, s.rcTop.bottom);
-        draw_text(dc, s.fBold, (s.res && !s.res->err.empty()) ? kRed : kDim, tr, tally, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
+        draw_text(dc, s.fBold, (s.res && !s.res->err.empty()) ? kRed : (scanned ? kAmb : kDim), tr, tally, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
     }
 
     // chips (laid out in layout_chips; the bar already has room for every row)
@@ -701,8 +736,8 @@ void paint(Gui& s, HDC dc, RECT client) {
         if (s.chips.empty()) {
             RECT hr = rect(s.rcChips.left + m, s.rcChips.top, s.rcChips.right - m, s.rcChips.bottom);
             draw_text(dc, s.fSmall, kDim, hr,
-                      L"no filters — click a facet to drill in, right-click to exclude; right-click any cell in the table for only / not by "
-                      L"name, folder, size or date; picks become chips here and compile into the query below",
+                      L"no filters — click a facet to drill in, right-click to exclude; right-click any cell for only / not by name, folder, "
+                      L"size or date; type in \"contains\" (Ctrl+K) to keep only files whose contents hold a phrase (everywhere)",
                       DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         }
     }
@@ -749,9 +784,10 @@ void paint(Gui& s, HDC dc, RECT client) {
     // table header
     fill(dc, s.rcHeader, kPanel2);
     {
-        static const wchar_t* names[4] = { L"Name", L"Path", L"Size", L"Modified" };
-        static const SortKey keys[4] = { SortKey::Name, SortKey::Path, SortKey::Size, SortKey::Modified };
-        for (int c = 0; c < 4; ++c) {
+        static const wchar_t* names[5] = { L"Name", L"Path", L"Hits", L"Size", L"Modified" };
+        static const SortKey keys[5] = { SortKey::Name, SortKey::Path, SortKey::Hits, SortKey::Size, SortKey::Modified };
+        for (int c = 0; c < 5; ++c) {
+            if (s.col_x[c + 1] <= s.col_x[c]) continue;   // a zero-width column (Hits without a scan)
             RECT hr = rect(s.col_x[c], s.rcHeader.top, s.col_x[c + 1] - px(s, 8), s.rcHeader.bottom);
             std::wstring t = names[c];
             if (s.sort == keys[c]) t += s.ascending ? L" ▲" : L" ▼";
@@ -778,9 +814,12 @@ void paint(Gui& s, HDC dc, RECT client) {
                           std::wstring(f->row_name(rw)), DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
                 draw_text(dc, s.fNorm, kDim, rect(s.col_x[1], rr.top, s.col_x[2] - px(s, 8), rr.bottom), f->dir_path(rw.dir),
                           DT_LEFT | DT_VCENTER | DT_PATH_ELLIPSIS);
-                draw_text(dc, s.fNorm, kDim, rect(s.col_x[2], rr.top, s.col_x[3] - px(s, 8), rr.bottom),
+                if (s.col_x[3] > s.col_x[2])
+                    draw_text(dc, s.fNorm, rw.matches ? kAmb : kDim, rect(s.col_x[2], rr.top, s.col_x[3] - px(s, 8), rr.bottom),
+                              widen(fmt_count(rw.matches)), DT_RIGHT | DT_VCENTER);
+                draw_text(dc, s.fNorm, kDim, rect(s.col_x[3], rr.top, s.col_x[4] - px(s, 8), rr.bottom),
                           rw.folder ? L"<dir>" : widen(human_bytes(rw.size)), DT_RIGHT | DT_VCENTER);
-                draw_text(dc, s.fNorm, kDim, rect(s.col_x[3], rr.top, s.col_x[4], rr.bottom), widen(fmt_filetime(rw.mtime, false)),
+                draw_text(dc, s.fNorm, kDim, rect(s.col_x[4], rr.top, s.col_x[5], rr.bottom), widen(fmt_filetime(rw.mtime, false)),
                           DT_RIGHT | DT_VCENTER);
             }
             if (f->rows.empty()) draw_text(dc, s.fNorm, kDim, s.rcTable, s.busy ? L"" : L"no matches", DT_CENTER | DT_VCENTER);
@@ -795,9 +834,12 @@ void paint(Gui& s, HDC dc, RECT client) {
         std::wstring st = s.status;
         if (st.empty()) {
             st = L"QUERY  " + (s.compiled.empty() ? L"(everything)" : s.compiled);
+            if (f && !s.res->run.grep.empty())
+                st += L"   ·   contains \"" + s.res->run.grep + L"\"  (everywhere: " + widen(fmt_count(s.res->run.hit_files)) + L" of " +
+                      widen(fmt_count(s.res->run.scanned_files)) + L" files, " + widen(fmt_count(s.res->run.matches)) + L" matches)";
             if (f && f->rows.size() < s.res->total)
                 st += L"     ·  showing the first " + widen(fmt_count(f->rows.size())) + L" of " + widen(fmt_count(s.res->total)) + L" rows";
-            st += L"     ·  Ctrl+L query · Esc clear · Ctrl+Shift+C copy query · Ctrl+T pin";
+            st += L"     ·  Ctrl+L query · Ctrl+K contains · Esc clear · Ctrl+Shift+C copy · Ctrl+T pin";
         }
         RECT sr = rect(s.rcStatus.left + m, s.rcStatus.top, s.rcStatus.right - m, s.rcStatus.bottom);
         draw_text(dc, s.fSmall, kDim, sr, st, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
@@ -807,6 +849,7 @@ void paint(Gui& s, HDC dc, RECT client) {
 void update_title(Gui& s) {
     std::wstring t = L"facet";
     if (!s.query.empty()) t += L" — " + s.query;
+    if (!s.grep.empty()) t += L" ∩ \"" + s.grep + L"\"";
     if (s.res && s.res->f) t += L" · " + widen(fmt_count(s.res->total));
     SetWindowTextW(s.hwnd, t.c_str());
 }
@@ -871,9 +914,14 @@ int hit_chip(const Gui& s, POINT p) {
 }
 int hit_col(const Gui& s, POINT p) {
     if (!PtInRect(&s.rcHeader, p)) return -1;
-    for (int c = 0; c < 4; ++c)
-        if (p.x >= s.col_x[c] - px(s, 4) && p.x < s.col_x[c + 1] - px(s, 4)) return c;
+    for (int c = 0; c < 5; ++c)
+        if (s.col_x[c + 1] > s.col_x[c] && p.x >= s.col_x[c] - px(s, 4) && p.x < s.col_x[c + 1] - px(s, 4)) return c;
     return -1;
+}
+// what the compiled query and the scan look like as a shell pipeline (Ctrl+Shift+C after a scan)
+std::wstring copy_text_for(const Gui& s) {
+    if (scan_active(s)) return pipeline_text(s.compiled, s.res->run.grep, !s.opts.grep_regex, !s.opts.grep_case);
+    return s.compiled;
 }
 
 void ensure_visible(Gui& s) {
@@ -895,24 +943,39 @@ std::wstring sel_dir(const Gui& s) {
     return r.folder ? s.res->f->row_path(r) + L"\\" : s.res->f->dir_path(r.dir);
 }
 
-void read_query(Gui& s) {
-    const int n = GetWindowTextLengthW(s.edit);
+std::wstring edit_text(HWND h) {
+    const int n = h ? GetWindowTextLengthW(h) : 0;
     std::wstring t((size_t)n, L'\0');
-    if (n > 0) GetWindowTextW(s.edit, t.data(), n + 1);
-    s.query = t;
+    if (n > 0) GetWindowTextW(h, t.data(), n + 1);
+    return t;
 }
+void read_query(Gui& s) {
+    s.query = edit_text(s.edit);
+    s.grep = edit_text(s.edit2);
+    while (!s.grep.empty() && (s.grep.back() == L' ' || s.grep.back() == L'\t')) s.grep.pop_back();
+}
+
+bool scan_active(const Gui& s) { return s.res && s.res->f && !s.res->run.grep.empty(); }
 
 void set_sort(Gui& s, SortKey k) {
     if (s.sort == k) s.ascending = !s.ascending;
     else { s.sort = k; s.ascending = (k == SortKey::Name || k == SortKey::Path); }
+    if (scan_active(s)) {   // scan hits live here already: sort in place, no re-run
+        s.res->f->sort_rows(s.sort, s.ascending);
+        s.sel = -1;
+        s.stable.pos = 0;
+        InvalidateRect(s.hwnd, nullptr, FALSE);
+        return;
+    }
     submit(s);
 }
 
-// The column under x: name | path | size | modified
+// The column under x: name | path | hits | size | modified  (hits offers the name's picks: nothing Everything can select by)
 Column column_at(const Gui& s, int x) {
     if (x < s.col_x[1]) return Column::Name;
     if (x < s.col_x[2]) return Column::Path;
-    if (x < s.col_x[3]) return Column::Size;
+    if (x < s.col_x[3]) return Column::Name;
+    if (x < s.col_x[4]) return Column::Size;
     return Column::Modified;
 }
 
@@ -1010,9 +1073,11 @@ LRESULT CALLBACK edit_sub(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (wp == VK_F5) { submit(s); return 0; }
-        if (ctrl && shift && wp == 'C') { copy_text(s.hwnd, s.compiled); s.status = L"copied the query"; InvalidateRect(s.hwnd, nullptr, FALSE); return 0; }
+        if (ctrl && shift && wp == 'C') { copy_text(s.hwnd, copy_text_for(s)); s.status = scan_active(s) ? L"copied the pipeline" : L"copied the query"; InvalidateRect(s.hwnd, nullptr, FALSE); return 0; }
         if (ctrl && wp == 'A') { SendMessageW(h, EM_SETSEL, 0, -1); return 0; }
         if (ctrl && wp == 'T') { PostMessageW(s.hwnd, WM_KEYDOWN, 'T', 0); return 0; }
+        if (ctrl && wp == 'K' && s.edit2) { SetFocus(s.edit2); SendMessageW(s.edit2, EM_SETSEL, 0, -1); return 0; }
+        if (ctrl && wp == 'L') { SetFocus(s.edit); SendMessageW(s.edit, EM_SETSEL, 0, -1); return 0; }
     }
     if (m == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE || wp == 1)) return 0;   // no ding
     if (m == WM_SETFOCUS || m == WM_KILLFOCUS) InvalidateRect(s.hwnd, &s.rcTop, FALSE);
@@ -1029,6 +1094,11 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             s.edit_proc = (WNDPROC)SetWindowLongPtrW(s.edit, GWLP_WNDPROC, (LONG_PTR)edit_sub);
             s.edit_brush = CreateSolidBrush(kEditBg);
             SendMessageW(s.edit, EM_SETLIMITTEXT, 4000, 0);
+            // the contains box: a phrase everywhere looks for inside the result set's files
+            s.edit2 = CreateWindowExW(0, L"EDIT", s.grep.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_LEFT, 0, 0, 10, 10, h,
+                                      (HMENU)(INT_PTR)kEdit2Id, GetModuleHandleW(nullptr), nullptr);
+            SetWindowLongPtrW(s.edit2, GWLP_WNDPROC, (LONG_PTR)edit_sub);   // same class, same original proc
+            SendMessageW(s.edit2, EM_SETLIMITTEXT, 1000, 0);
             return 0;
         }
         case WM_CTLCOLOREDIT: {
@@ -1039,13 +1109,14 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         case WM_COMMAND:
             if (LOWORD(wp) == kEditId && HIWORD(wp) == EN_CHANGE) SetTimer(h, kDebounceTimer, 260, nullptr);
+            if (LOWORD(wp) == kEdit2Id && HIWORD(wp) == EN_CHANGE) SetTimer(h, kDebounce2Timer, 500, nullptr);   // a scan costs more than a query
             return 0;
         case WM_TIMER:
-            if (wp == kDebounceTimer) {
-                KillTimer(h, kDebounceTimer);
-                const std::wstring before = s.query;
+            if (wp == kDebounceTimer || wp == kDebounce2Timer) {
+                KillTimer(h, wp);
+                const std::wstring before = s.query, before2 = s.grep;
                 read_query(s);
-                if (before != s.query) { submit(s); update_title(s); }
+                if (before != s.query || before2 != s.grep) { submit(s); update_title(s); }
             } else if (wp == kShotTimer) {
                 KillTimer(h, kShotTimer);
                 const bool ok = save_shot(h, widen(s.opts.shot));
@@ -1118,6 +1189,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             else if (hrow >= 0) {
                 const Row& r = s.res->f->rows[(size_t)hrow];
                 st = s.res->f->row_path(r) + L"   ·   " + (r.folder ? L"folder" : widen(human_bytes(r.size))) + L"   ·   " + widen(fmt_filetime(r.mtime)) +
+                     (scan_active(s) ? L"   ·   " + widen(fmt_count(r.matches)) + L" matching lines" : L"") +
                      L"   ·   double-click opens · right-click a cell: only / not this name, folder level, size or date";
             } else if (hc >= 0) st = L"× removes this filter   ·   right-click pins it as a standing exclude (kept in facet.ini)";
             else if (hcol >= 0) st = L"click to sort by this column (Everything sorts; the list is re-fetched)";
@@ -1152,7 +1224,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             const POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             dbg("lbutton (%ld,%ld) rail=%d row=%d chip=%d col=%d thumb=%d/%d track=%d/%d", p.x, p.y, hit_rail(s, p), hit_row(s, p), hit_chip(s, p), hit_col(s, p),
                 PtInRect(&s.srail.thumb, p), PtInRect(&s.stable.thumb, p), PtInRect(&s.srail.track, p), PtInRect(&s.stable.track, p));
-            SetFocus(h);
+            if (!s.opts.no_activate || GetForegroundWindow() == h) SetFocus(h);
             if (PtInRect(&s.srail.thumb, p)) { s.drag = 1; s.drag_off = p.y - s.srail.thumb.top; SetCapture(h); return 0; }
             if (PtInRect(&s.stable.thumb, p)) { s.drag = 2; s.drag_off = p.y - s.stable.thumb.top; SetCapture(h); return 0; }
             if (PtInRect(&s.srail.track, p) && s.srail.total > s.srail.page) { s.srail.pos += (p.y < s.srail.thumb.top ? -1 : 1) * s.srail.page; s.srail.clamp(); InvalidateRect(h, nullptr, FALSE); return 0; }
@@ -1173,7 +1245,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             }
             const int hcol = hit_col(s, p);
             if (hcol >= 0) {
-                static const SortKey keys[4] = { SortKey::Name, SortKey::Path, SortKey::Size, SortKey::Modified };
+                static const SortKey keys[5] = { SortKey::Name, SortKey::Path, SortKey::Hits, SortKey::Size, SortKey::Modified };
                 set_sort(s, keys[hcol]);
                 return 0;
             }
@@ -1193,7 +1265,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case WM_RBUTTONDOWN: {
             const POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
             dbg("rbutton (%ld,%ld) rail=%d row=%d chip=%d", p.x, p.y, hit_rail(s, p), hit_row(s, p), hit_chip(s, p));
-            SetFocus(h);
+            if (!s.opts.no_activate || GetForegroundWindow() == h) SetFocus(h);
             const int hc = hit_chip(s, p);
             if (hc >= 0) {
                 Chip& c = s.chips[(size_t)hc];
@@ -1249,11 +1321,14 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 case VK_F5: submit(s); return 0;
                 case VK_DELETE: if (s.sel >= 0) add_chip(s, { Filter::Kind::DirOut, sel_dir(s) }, "dir"); return 0;
                 case 'C':
-                    if (ctrl && shift) { copy_text(h, s.compiled); s.status = L"copied the query"; }
+                    if (ctrl && shift) { copy_text(h, copy_text_for(s)); s.status = scan_active(s) ? L"copied the pipeline" : L"copied the query"; }
                     else if (ctrl && s.sel >= 0) { copy_text(h, sel_path(s)); s.status = L"copied  " + sel_path(s); }
                     break;
                 case 'L': case 'F':
                     if (ctrl) { SetFocus(s.edit); SendMessageW(s.edit, EM_SETSEL, 0, -1); }
+                    break;
+                case 'K':
+                    if (ctrl && s.edit2) { SetFocus(s.edit2); SendMessageW(s.edit2, EM_SETSEL, 0, -1); }
                     break;
                 case 'T':
                     if (ctrl || GetFocus() == h) {
@@ -1310,6 +1385,7 @@ int run_gui(const Opts& o) {
     if (!o.depth_set) state.opts.depth = 2;   // the rail is one column: keep every facet above the fold
     if (!o.top_set) state.opts.top = 8;
     state.query = o.query;
+    state.grep = o.grep;
     state.sort = o.sort;
     state.ascending = o.ascending;
     state.ini = o.ini.empty() ? exe_dir() + L"facet.ini" : widen(o.ini);
@@ -1358,8 +1434,9 @@ int run_gui(const Opts& o) {
         GetClientRect(state.hwnd, &rc);
         layout(state, rc);
     }
-    ShowWindow(state.hwnd, SW_SHOW);
-    SetFocus(state.edit);
+    // --no-activate: a scripted window must never take the keyboard from whoever is typing
+    ShowWindow(state.hwnd, o.no_activate ? SW_SHOWNOACTIVATE : SW_SHOW);
+    if (!o.no_activate) SetFocus(state.edit);
     {
         const LRESULT len = SendMessageW(state.edit, WM_GETTEXTLENGTH, 0, 0);   // caret at the end, not at 0
         SendMessageW(state.edit, EM_SETSEL, (WPARAM)len, (LPARAM)len);

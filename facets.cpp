@@ -153,8 +153,33 @@ void Facets::add(const EsItem& it) {
         r.size = it.size;
         r.mtime = it.mtime;
         r.folder = it.folder;
+        r.matches = it.matches;
         rows.push_back(r);
     }
+}
+
+void Facets::sort_rows(SortKey key, bool asc) {
+    auto lower = [](std::wstring s) { for (auto& c : s) c = (wchar_t)towlower(c); return s; };
+    auto ext_of = [&](const Row& r) {
+        const std::wstring_view n = row_name(r);
+        const size_t dot = n.find_last_of(L'.');
+        return dot == std::wstring_view::npos ? std::wstring() : lower(std::wstring(n.substr(dot + 1)));
+    };
+    std::stable_sort(rows.begin(), rows.end(), [&](const Row& a, const Row& b) {
+        int c = 0;
+        switch (key) {
+            case SortKey::Name: c = lower(std::wstring(row_name(a))).compare(lower(std::wstring(row_name(b)))); break;
+            case SortKey::Path: c = lower(row_path(a)).compare(lower(row_path(b))); break;
+            case SortKey::Size: c = a.size < b.size ? -1 : (a.size > b.size ? 1 : 0); break;
+            case SortKey::Ext: c = ext_of(a).compare(ext_of(b)); break;
+            case SortKey::Hits: c = a.matches < b.matches ? -1 : (a.matches > b.matches ? 1 : 0); break;
+            default: {   // modified (and created / recent, which the fold does not carry)
+                const uint64_t x = a.mtime == kUnknown64 ? 0 : a.mtime, y = b.mtime == kUnknown64 ? 0 : b.mtime;
+                c = x < y ? -1 : (x > y ? 1 : 0);
+            }
+        }
+        return asc ? c < 0 : c > 0;
+    });
 }
 
 void Facets::finish() {

@@ -2,7 +2,10 @@
 
 *Brainstorm 2026-09-02, morning. **Shape A is built the same day** (facet 0.3.0, everywhen
 with `--paths` / `--json` / `locate`; everywhere already spoke the contract): pipelines 1, 2 and
-3 below run as written, with measured numbers in the facet README. B, C and D remain proposals.*
+3 below run as written, with measured numbers in the facet README. **Shape D, everywhere half:
+built the same afternoon** (facet 0.4.0): the window's contains box and the CLI's `--grep` run
+the pipeline in one pass and fold only the hits. Still proposals: B (`--mcp` on everywhere and
+everywhen), C (a front verb), and D's sessions mode (everywhen as a source in the window).*
 
 ## The three axes
 

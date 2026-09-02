@@ -20,6 +20,7 @@ struct EsItem {                   // views into the IPC reply — valid only ins
     uint64_t mtime = kUnknown64;  // FILETIME ticks, UTC; kUnknown64 when none
     bool folder = false;
     bool drive = false;
+    uint32_t matches = 0;         // content hits in this file (a scan's count), 0 = none / no scan
 };
 
 struct EsPage {

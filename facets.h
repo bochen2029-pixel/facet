@@ -59,6 +59,7 @@ struct Row {                          // a retained result
     uint32_t name_off = 0, name_len = 0;
     uint64_t size = kUnknown64, mtime = kUnknown64;
     bool folder = false;
+    uint32_t matches = 0;             // content hits (after a scan)
 };
 
 struct FacetConfig {
@@ -92,6 +93,7 @@ public:
     std::wstring dir_path(uint32_t node) const;          // "C:\a\b\"  (root = "")
     std::wstring row_path(const Row& r) const;
     std::wstring_view row_name(const Row& r) const;
+    void sort_rows(SortKey key, bool ascending);         // local order for rows that did not come sorted (scan hits)
     const FacetConfig& config() const { return cfg_; }
 
     static int size_bucket(uint64_t size, bool folder);   // index into sizes[]

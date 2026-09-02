@@ -147,3 +147,23 @@ Running notes, newest at the bottom. Decisions, measurements, test results.
   real / missing / folder path, walk_paths == count, tape fold round-trip. Trap logged twice
   now: a check message that reads its numbers must be built AFTER the call it reports on —
   argument evaluation order made "tape fold: 0 paths" print for a passing check.
+
+## 2026-09-02 · 0.4.0 — shape D, the everywhere half: "contains"
+
+- One pass, three organs: the base set (a query, or a tape) streams from Everything; with
+  --grep every file goes down a pipe to everywhere.exe (`--files-from - -F -i -e PHRASE --jsonl
+  -c --quiet`, two reader threads so neither pipe can deadlock); the count records come back
+  and only the hits are folded, each row carrying its matching-line count. `run_pass()` moved
+  behind pass.h with cancel + progress hooks so the window runs the very same pass on its
+  worker thread; scan.h/.cpp own the child process (CREATE_NO_WINDOW, kill on cancel,
+  exit-code parity with rg: 0 hit · 1 none · 2 error + stderr text).
+- Window: a "contains" box (Ctrl+K) beside the query box; the tally walks the phases
+  (searching → everywhere: scanning N files → folding); a Hits column appears after a scan
+  and header clicks then sort locally (the hits are already here, no re-run); the status line
+  names the scan and Ctrl+Shift+C copies the shell pipeline instead of the query.
+- Measured: `--grep facet path:C:\facet\ ext:md` → 3 of 3 files, 103 matches, 160 ms; the
+  window: 1,255 markdown files scanned in a few seconds → 57 contain "facet"; clearing the box
+  restores 1,255. Selftest: quote_arg, a live scan (4 fed, 2 hit, 83 matches, 186 ms), the pass
+  with --grep over a tape (2 of 3 folded), pipeline_text.
+- Guard: --scan-max (1,000,000 files) refuses a scan that would take minutes and says so; the
+  tally is the budget.
