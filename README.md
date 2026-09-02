@@ -1,0 +1,167 @@
+# facet — pivot filtering over Everything's index
+
+**Everything answers *which* files match. facet answers *where they went* — the distribution of a
+result set by directory (a tree with counts), extension, modified date, size, and write burst —
+and every pick compiles back into Everything syntax, so the query you paste is the query that
+produced the numbers.**
+
+The problem it removes, measured on the reference box: 7.1 million items indexed;
+`ext:md dm:last3days` finds 3,811; sorted by date you page past directories only an application
+would write to, and you cannot see what to exclude until you have scrolled through it. Only 173
+of those hits were under `AppData`. 2,797 of them landed in **one second** under a single repo
+clone. A static exclude list cannot track that — the noise is a different directory every week —
+but a facet computed from the live result set can, and *files per minute* turns out to be a
+provenance signal Everything does not have: thousands in a minute is a clone or extract, a dozen
+is an agent session, one or two is a hand.
+
+Single ~0.5 MB exe. C/C++ only, OS APIs only, zero dependencies, no installer, no elevation, no
+DLL. The index stays Everything's: facet speaks its WM_COPYDATA IPC (the channel `es.exe` uses),
+streams the result in pages, and folds them into facets with bounded memory.
+
+## Use
+
+```
+facet ext:md dm:last3days              the report: directories · extensions · modified · size · bursts · the query
+facet -x C:\deepseek-harness-master ext:md dm:last3days     drop a subtree      → !path:"C:\deepseek-harness-master\"
+facet -i C:\NEW --since 12h ext:md                          drill in + a window → path:"C:\NEW\" dm:last720mins
+facet --flat 2 ""                      every item on every volume, ranked by drive\folder (7.1 M items in ~10 s)
+facet -l -n 50 ext:md dm:today         rows, newest first  ·  -ll adds size + date  ·  -s size|name|path|ext  ·  -a
+facet -c ext:md                        count only (37 ms for the whole disk)
+facet -j ...                           JSON for agents: the report, rows with -l, the count with -c
+facet --gui [query]                    the window (milestone 2)  ·  facetw.exe opens it with no console at all
+facet --mcp                            MCP stdio server — tools: facet_query, facet_list, facet_count
+facet --selftest                       parser, fold, compiler, formatting + live IPC checks
+facet --help                           every flag, the JSON shape, exit codes
+```
+
+`<query>` is Everything syntax, verbatim — `ext:md dm:today`, `path:C:\NEW\`, `size:>1mb`,
+`!draft`, `a|b`, `"exact phrase"`, `regex:^foo` — anything Everything accepts. Empty = every item.
+
+## Reading the report
+
+```
+facet 0.1.0  ext:md dm:last3days
+3,812 items · 3,812 files · 0 folders · 79 MB · Everything 1.4.1.1026 · 29 ms
+
+DIRECTORIES                                                    items  share      bytes
+ C:\deepseek-harness-master\               █████████░░░       2,841  74.5%      21 MB
+   .agents\                                █████░░░░░░░       1,682  44.1%      12 MB
+     notes\                                █████░░░░░░░       1,658  43.5%      11 MB
+   packages\                               ██░░░░░░░░░░         620  16.3%     4.6 MB
+   (files right here)                                             13
+   +7 more directories                                            91
+ C:\Users\user\                            █░░░░░░░░░░░         218   5.7%     3.6 MB
+   AppData\Local\                          █░░░░░░░░░░░         173   4.5%     3.4 MB
+ ...
+ MODIFIED                          SIZE                          EXTENSIONS
+ today            683  17.9%       1 B - 4 KB     1,253  32.9%   .md      3,812  100%
+ yesterday        273   7.2%       4 KB - 64 KB   2,409  63.2%
+ 2 - 7 days ago 2,856  74.9%       ...
+
+WRITE BURSTS  files landing within 60 s of each other
+   2,797  2026-08-30 08:37:53 -> 08:37:53 C:\deepseek-harness-master\  >  .agents\ 59%  ·  packages\ 22%  ·  docs\ 8%
+      82  2026-09-01 03:00:15 -> 03:00:39 D:\ClaudeCodeBackups\readable\  >  C--greenfield\ 47%  ·  ...
+  hand-paced: 198 files in 161 bursts of 1-2  ·  252 bursts in all  ·  last hour: 9 items
+
+QUERY  ext:md dm:last3days
+```
+
+- **DIRECTORIES** — where the matches live, ranked across drives (drive + first folder are the
+  top entries; a lone `C:\ 100%` line says nothing). A chain such as `C:\Users\user\` collapses
+  into one label when every level has nothing of its own. *(files right here)* are items sitting
+  directly in that folder; directories below the fold (1 % of the result set, or `--min N`) are
+  summed into *+N more*. `--depth` sets how far the tree opens, `--top` how many per level,
+  `--flat N` ranks bare prefixes at depth N instead.
+- **MODIFIED / SIZE / EXTENSIONS** — fixed buckets with counts and shares. Each bucket carries the
+  Everything term that selects exactly it (`dm:today`, `dm:2026-08-25..2026-08-30`,
+  `size:4096..65535`, `ext:md`); `-j` prints them, `--selftest` verifies them against Everything.
+- **WRITE BURSTS** — every dated item, sorted by modified time and split wherever the silence
+  exceeds `--burst-gap` (60 s). For each of the biggest bursts: when, how many, and where — the
+  deepest directory holding ≥ 90 % of it, and where that splits, the biggest pieces below it.
+  Each burst compiles to `dm:START..END` at second precision (`-j` prints it). The footer
+  counts the hand-paced tail: bursts of one or two files.
+- **QUERY** — the compiled Everything query. Every `-x` / `-i` / `-e` / `--since` / `--files` is
+  in it; paste it into Everything's search box or into `search.py`.
+
+## The numbers, honestly
+
+- Counts are Everything's: the compiled query is sent to the running instance and every result
+  is streamed back — facet never re-implements matching, so `facet -c Q` equals Everything's
+  status bar for `Q`. Excludes/includes compile to `path:"DIR\"`; the trailing separator is what
+  makes it a subtree test (`C:\NEW\` cannot match `C:\NEWER\`).
+- facet requests name, path, size and date-modified only. Size and date-modified are indexed on
+  the reference box; date-created is not, and asking for an unindexed property makes Everything
+  read it from disk per row — so facet never asks.
+- Folders carry no size (folder-size indexing is off); they count as items, sit in the
+  *folders / no size* bucket, and are excluded from byte totals.
+- Modified buckets use local calendar days; *today* / *yesterday* compile to Everything's own
+  constants, the rest to absolute `dm:A..B` ranges; ranges are inclusive at day and at second
+  precision (measured). Everything 1.4 spells relative windows in the plural — `last3days`,
+  `last720mins` — so `--since 12h` compiles to minutes and `--since 2w` to days.
+- Bursts are clusters of modified times, not process attribution: a burst tells you *something*
+  wrote N files in that window and where; the directory usually says what.
+- Peak memory is proportional to the result set: ~460 MB for all 7.1 M items on the reference
+  box (one 16-byte event per dated item plus the directory trie), a few MB for a typical query.
+
+## Agents
+
+```bash
+facet -j "ext:md dm:today"                       where today's markdown went, by directory
+facet -j --flat 2 --since 1h ""                  what wrote to the disk in the last hour
+facet -l -j -n 50 -x C:\deepseek-harness-master "ext:md dm:today"
+facet -c "ext:pdf size:>10mb"                    the cheapest probe
+claude mcp add facet -- C:/facet/facet.exe --mcp # tools: facet_query, facet_list, facet_count
+```
+
+JSON shape (single line, stable field names): `{tool,version,query,compiled,everything,total,
+scanned,files,folders,bytes,unknown_size,last_hour,elapsed_ms,error, directories[{path,count,
+share,bytes,files_here,children[...],more{directories,items}}], extensions[{ext,count,share,
+bytes}], modified[{bucket,query,count,bytes}], size[{bucket,query,count,bytes}], bursts[{start,
+end,seconds,count,dir,dir_share,parts[{dir,share}],query}], bursts_total, handpaced{bursts,
+files}, burst_gap_s}`. Every bucket's / burst's `query` is the Everything term selecting it;
+append it to `compiled` to drill in. Exit codes: 0 ok · 1 bad arguments · 2 Everything
+unreachable / IPC error (JSON still emitted with `error`) · 3 selftest failed.
+
+## Speed (reference box: 7.1 M items indexed, Everything 1.4.1.1026, i9 / NVMe)
+
+| query                     | items      | wall      |
+|---------------------------|-----------:|----------:|
+| `-c` anything             | —          | ~40 ms    |
+| `ext:md dm:last3days`     | 3,812      | ~30 ms    |
+| `ext:md dm:last7days`     | 382,307    | ~380 ms   |
+| `""` (every item)         | 7,135,216  | ~10 s     |
+
+The whole-disk pass is bounded by Everything formatting 7.1 M rows into IPC pages, not by the
+fold (`--page 262144` shaves ~5 %; 65,536 is the default for its smaller working set).
+
+## Build
+
+```
+build.bat     # VS2022: cl /std:c++20 /O2 /W4 /permissive- /utf-8 /MT → facet.exe + facetw.exe
+```
+
+Files: `everything_ipc.h` (the IPC contract: QUERY2 / LIST2 / ITEM2, request flags, sorts) ·
+`es_client.h/.cpp` (the collector: reply window, paging, parser; OS glue) · `facets.h/.cpp` (the
+fold: directory trie, extensions, buckets, bursts, retained rows) · `query.h` (the compiler:
+picks → Everything syntax) · `app_util.h` (options, formatting, Unicode-width columns) ·
+`facet.cpp` (report, list, count, JSON, MCP, selftest) · `facet_gui.cpp` (the window) ·
+`facet.rc` + `facet.manifest` (version info, PerMonitorV2 DPI, UTF-8 code page, long paths) ·
+`docs/devlog.md` (decisions and measurements as they happened).
+
+## Known limits
+
+- Everything must be running (the GUI instance; the service alone has no IPC window). facet
+  says so and exits 2 otherwise.
+- Everything 1.4 answers one page per WM_COPYDATA; facet streams pages of `--page` items
+  (65,536). The database is live, so two passes seconds apart can differ by a few items.
+- *in the future* and *no date* buckets have no query term; Everything 1.4 has no `dm:` form
+  for "unknown".
+- Windows only, by construction — the whole point is the WDDM-era MFT index Everything keeps.
+
+## Why Everything itself does not do this
+
+Everything's query language always combined filters (`ext:md dm:last3days !path:"C:\x\"` has
+worked for years) and 1.5 adds multi-column sort — but the UI never shows the *shape* of a result
+set, so you can only exclude what you already know to exclude, and you learn that by paging past
+it. Faceted navigation is the standard answer (every search engine's left rail); nobody had put
+one on Everything's index. facet is that rail, headless first so agents get it too.
