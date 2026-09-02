@@ -40,6 +40,19 @@ struct EsInfo {
 
 uint32_t ipc_sort(SortKey k, bool ascending);
 
+struct EsLaunch {                 // how connect() may bring Everything up when it is not running
+    bool allow_start = true;      // find Everything.exe and start it "-startup" (tray only, no window)
+    std::wstring exe_override;    // --everything-exe PATH / FACET_EVERYTHING
+    uint32_t wait_ms = 30000;     // for the IPC window, then for the database
+};
+
+// Where an Everything.exe lives: the override, FACET_EVERYTHING, the registry (App Paths and the
+// Uninstall keys, both views), the usual install folders, scoop / chocolatey, then PATH.
+// Empty when none exists.
+std::wstring find_everything_exe(const std::wstring& override_path = L"");
+// The text printed when no Everything.exe exists anywhere: what it is, where to get it, what to do.
+const char* everything_install_hint();
+
 // Talks to the running Everything instance. The reply window is created on the thread that
 // first queries, so keep one Everything per thread.
 class Everything {
@@ -50,9 +63,13 @@ public:
     Everything(const Everything&) = delete;
     Everything& operator=(const Everything&) = delete;
 
-    bool connect(std::string* err = nullptr);   // find the IPC window, read version + index flags
+    EsLaunch launch;                                    // knobs for connect()
+    std::function<void(const std::string&)> on_note;    // "starting Everything…" lines (stderr / status)
+
+    bool connect(std::string* err = nullptr);   // find the IPC window (starting Everything if allowed), read version + index flags
     const EsInfo& info() const;
     bool fast_sort(uint32_t ipc_sort_type) const;
+    bool running() const;                       // an IPC window exists right now
 
     // Stream q in pages of page_size, sorted by sort_type. Stops after max_items (0 = all) or
     // when the sink returns false. False (with err) only on IPC failure.

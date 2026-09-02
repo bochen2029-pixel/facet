@@ -20,7 +20,7 @@ constexpr uint64_t kTicksPerDay = 864000000000ull;
 enum class SortKey { Modified, Name, Path, Size, Ext, Created, Recent };
 
 struct Opts {
-    enum class Mode { Auto, Report, List, Count, Gui, Mcp, Selftest, Help, Version };
+    enum class Mode { Auto, Report, List, Count, Gui, Mcp, Selftest, Where, MakeIcon, Shortcut, Help, Version };
     Mode mode = Mode::Auto;
     bool json = false;
     std::wstring query;                    // the Everything query, verbatim
@@ -46,6 +46,10 @@ struct Opts {
     bool quiet = false;                    // no progress on stderr
     uint32_t page = 65536;                 // IPC page size
     std::string shot;                      // --gui --shot FILE.png: render once, save, exit
+    bool no_start = false;                 // never launch Everything ourselves
+    std::wstring everything_exe;           // --everything-exe PATH (or FACET_EVERYTHING)
+    std::string out_file;                  // --make-icon FILE.ico · --shortcut [startmenu|desktop]
+    std::string ini;                       // --ini PATH: the window's settings file (default facet.ini next to the exe)
 };
 
 inline const char* sort_key_name(SortKey k) {

@@ -161,12 +161,132 @@ bool parse_list2(const void* data, size_t cb, std::vector<EsItem>& out, EsPage& 
     return true;
 }
 
+// ---------------------------------------------------------------- finding and starting Everything
+namespace {
+
+bool file_exists(const std::wstring& p) {
+    const DWORD a = GetFileAttributesW(p.c_str());
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+std::wstring env_str(const wchar_t* name) {
+    wchar_t buf[4096];
+    const DWORD n = GetEnvironmentVariableW(name, buf, (DWORD)std::size(buf));
+    return (n && n < std::size(buf)) ? std::wstring(buf, n) : std::wstring();
+}
+
+// Everything 1.5 alpha runs as a named instance; its IPC window carries the instance name
+HWND find_ipc_window() {
+    HWND h = FindWindowW(ipc::kWndClass, nullptr);
+    if (!h) h = FindWindowW(L"EVERYTHING_TASKBAR_NOTIFICATION_(1.5a)", nullptr);
+    return h;
+}
+
+bool launch_everything(const std::wstring& exe, std::string* err) {
+    std::wstring cmd = L"\"" + exe + L"\" -startup";     // -startup: index in the tray, open no window
+    const size_t slash = exe.find_last_of(L'\\');
+    const std::wstring dir = slash == std::wstring::npos ? L"." : exe.substr(0, slash);
+    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+    buf.push_back(0);
+    STARTUPINFOW si{};
+    si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    std::vector<wchar_t> buf2 = buf;   // CreateProcess may edit its command line; the retry gets a fresh copy
+    // CREATE_BREAKAWAY_FROM_JOB: outlive an agent harness's job object; fall back when the job forbids it
+    BOOL ok = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, FALSE, CREATE_BREAKAWAY_FROM_JOB, nullptr, dir.c_str(), &si, &pi);
+    if (!ok && GetLastError() == ERROR_ACCESS_DENIED)
+        ok = CreateProcessW(exe.c_str(), buf2.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi);
+    if (!ok) {        if (err) *err = ssprintf("could not start %s (error %lu)", narrow(exe).c_str(), (unsigned long)GetLastError());
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+}  // namespace
+
+const char* everything_install_hint() {
+    return "Everything is not installed on this machine (no Everything.exe in the registry, Program Files,\n"
+           "  LocalAppData\\Programs, scoop, chocolatey or PATH). facet rides on Everything's index and cannot\n"
+           "  work without it. Get it, free (~2 MB): https://www.voidtools.com/downloads/  -> Everything 1.4\n"
+           "  installer (x64) or the portable zip. Install it, run it once so it indexes the drives (about a\n"
+           "  minute), then retry. Or point facet at an Everything.exe: --everything-exe PATH or\n"
+           "  FACET_EVERYTHING=PATH.";
+}
+
+std::wstring find_everything_exe(const std::wstring& override_path) {
+    if (!override_path.empty()) return file_exists(override_path) ? override_path : L"";
+    const std::wstring ev = env_str(L"FACET_EVERYTHING");
+    if (!ev.empty() && file_exists(ev)) return ev;
+    std::vector<std::wstring> c;
+    auto reg = [&](HKEY root, const wchar_t* key, const wchar_t* value, REGSAM view) {
+        HKEY h;
+        if (RegOpenKeyExW(root, key, 0, KEY_READ | view, &h) != ERROR_SUCCESS) return;
+        wchar_t buf[2048];
+        DWORD cb = sizeof buf, type = 0;
+        if (RegQueryValueExW(h, value, nullptr, &type, (BYTE*)buf, &cb) == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
+            std::wstring v(buf, cb / sizeof(wchar_t));
+            while (!v.empty() && v.back() == 0) v.pop_back();
+            if (type == REG_EXPAND_SZ) {
+                wchar_t ex[2048];
+                if (ExpandEnvironmentStringsW(v.c_str(), ex, (DWORD)std::size(ex))) v = ex;
+            }
+            if (!v.empty() && v[0] == L'"') {
+                const size_t q = v.find(L'"', 1);
+                if (q != std::wstring::npos) v = v.substr(1, q - 1);
+            }
+            const size_t comma = v.rfind(L',');                 // DisplayIcon may be "path,0"
+            if (comma != std::wstring::npos && v.size() - comma <= 4) v.resize(comma);
+            if (v.empty()) return;
+            const bool is_exe = v.size() > 4 && _wcsicmp(v.c_str() + v.size() - 4, L".exe") == 0;
+            if (is_exe) c.push_back(v);
+            else {
+                if (v.back() != L'\\') v += L'\\';
+                c.push_back(v + L"Everything.exe");
+                c.push_back(v + L"Everything64.exe");
+            }
+        }
+        RegCloseKey(h);
+    };
+    for (REGSAM view : { (REGSAM)KEY_WOW64_64KEY, (REGSAM)KEY_WOW64_32KEY }) {
+        for (HKEY root : { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER }) {
+            reg(root, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\Everything.exe", L"", view);
+            for (const wchar_t* k : { L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Everything",
+                                      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Everything 1.5a",
+                                      L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Everything 1.5" }) {
+                reg(root, k, L"DisplayIcon", view);
+                reg(root, k, L"InstallLocation", view);
+            }
+        }
+    }
+    const std::wstring roots[] = {
+        env_str(L"ProgramFiles"), env_str(L"ProgramFiles(x86)"), env_str(L"ProgramW6432"),
+        env_str(L"LOCALAPPDATA") + L"\\Programs", env_str(L"ProgramData") + L"\\chocolatey\\lib\\everything\\tools",
+        env_str(L"USERPROFILE") + L"\\scoop\\apps\\everything\\current",
+    };
+    for (const auto& r : roots) {
+        if (r.empty() || r[0] == L'\\') continue;
+        for (const wchar_t* sub : { L"\\Everything\\Everything.exe", L"\\Everything\\Everything64.exe",
+                                    L"\\Everything 1.5a\\Everything64.exe", L"\\Everything 1.5a\\Everything.exe",
+                                    L"\\Everything.exe", L"\\Everything64.exe" })
+            c.push_back(r + sub);
+    }
+    wchar_t found[MAX_PATH];
+    if (SearchPathW(nullptr, L"Everything.exe", nullptr, MAX_PATH, found, nullptr)) c.push_back(found);
+    for (const auto& p : c)
+        if (file_exists(p)) return p;
+    return L"";
+}
+
 // ---------------------------------------------------------------- the client
 struct Everything::Impl {
     HWND target = nullptr;
     HWND reply = nullptr;
     EsInfo info;
     bool info_ok = false;
+    bool start_tried = false;   // one launch attempt per Everything object
+    bool db_waited = false;
     const EsSink* sink = nullptr;
     bool got = false;      // a reply arrived for the outstanding query
     bool more = true;      // the sink wants more pages
@@ -291,12 +411,40 @@ Everything::~Everything() {
 }
 const EsInfo& Everything::info() const { return p_->info; }
 
+bool Everything::running() const { return find_ipc_window() != nullptr; }
+
 bool Everything::connect(std::string* err) {
-    HWND h = FindWindowW(ipc::kWndClass, nullptr);
+    HWND h = find_ipc_window();
+    if (!h && launch.allow_start && !p_->start_tried) {
+        p_->start_tried = true;
+        const std::wstring exe = find_everything_exe(launch.exe_override);
+        if (exe.empty()) {
+            if (err) {
+                *err = launch.exe_override.empty() ? std::string(everything_install_hint())
+                                                   : "no Everything.exe at " + narrow(launch.exe_override) + "\n  " + everything_install_hint();
+            }
+            p_->target = nullptr;
+            return false;
+        }
+        if (on_note) on_note("Everything is not running - starting " + narrow(exe) + " -startup (tray only)");
+        if (!launch_everything(exe, err)) return false;
+        const ULONGLONG t0 = GetTickCount64();
+        while (!(h = find_ipc_window()) && GetTickCount64() - t0 < launch.wait_ms) Sleep(100);
+        if (!h) {
+            if (err) *err = ssprintf("started Everything but its IPC window did not appear within %u s", launch.wait_ms / 1000);
+            return false;
+        }
+        while (probe(h, ipc::kIsDbLoaded, 0) != 1 && GetTickCount64() - t0 < launch.wait_ms) Sleep(200);
+        p_->db_waited = true;
+        if (on_note) on_note(ssprintf("Everything is up - database loaded after %.1f s", (double)(GetTickCount64() - t0) / 1000.0));
+    }
     if (!h) {
-        if (err)
-            *err = "Everything is not running (IPC window not found)\n"
-                   "  start it: \"C:\\Program Files (x86)\\Everything\\Everything.exe\"";
+        if (err) {
+            const std::wstring exe = find_everything_exe(launch.exe_override);
+            *err = "Everything is not running (IPC window not found)";
+            if (exe.empty()) *err += "\n  " + std::string(everything_install_hint());
+            else *err += "\n  start it: \"" + narrow(exe) + "\"" + (launch.allow_start ? "" : "   (facet starts it itself unless --no-start)");
+        }
         p_->target = nullptr;
         p_->info_ok = false;
         return false;
@@ -314,6 +462,13 @@ bool Everything::connect(std::string* err) {
         i.created_indexed = probe(h, ipc::kIsFileInfoIndexed, ipc::kFileInfoDateCreated) == 1;
         p_->info = i;
         p_->info_ok = i.major > 0;
+    }
+    if (!p_->info.db_loaded && !p_->db_waited) {
+        // a freshly started Everything answers version probes before its database is in memory
+        p_->db_waited = true;
+        const ULONGLONG t0 = GetTickCount64();
+        while (probe(h, ipc::kIsDbLoaded, 0) != 1 && GetTickCount64() - t0 < 8000) Sleep(200);
+        p_->info.db_loaded = probe(h, ipc::kIsDbLoaded, 0) == 1;
     }
     return true;
 }

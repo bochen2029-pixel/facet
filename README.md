@@ -31,10 +31,24 @@ facet -l -n 50 ext:md dm:today         rows, newest first  ·  -ll adds size + d
 facet -c ext:md                        count only (37 ms for the whole disk)
 facet -j ...                           JSON for agents: the report, rows with -l, the count with -c
 facet --gui [query]                    the window: click a facet to drill in, right-click to exclude  ·  facetw.exe = no console
+facet --shortcut                       put "facet" in the Start Menu (type facet in Start, pin it from there) · --shortcut desktop
 facet --mcp                            MCP stdio server — tools: facet_query, facet_list, facet_count
+facet --where                          which Everything.exe facet found, whether it is running, what is indexed
 facet --selftest                       parser, fold, compiler, formatting + live IPC checks
 facet --help                           every flag, the JSON shape, exit codes
 ```
+
+## Everything: found, started, or explained
+
+facet needs the running Everything instance (1.4, or the 1.5 alpha's named instance; both IPC
+windows are tried). When none is running, facet looks for `Everything.exe` — the registry's
+App Paths and Uninstall keys in both views, Program Files, LocalAppData\Programs, scoop,
+chocolatey, PATH, or `--everything-exe PATH` / `FACET_EVERYTHING=PATH` for portable copies —
+starts it with `-startup` (tray only, no window), waits for its IPC window and for the database
+to load, says so on stderr, and carries on. `--no-start` disables that. When no `Everything.exe`
+exists at all, facet prints what Everything is, where to get it (https://www.voidtools.com/downloads/)
+and what to do; with `-j` the same text sits in `error`, so an agent can relay it verbatim.
+`facet --where` shows both answers on demand.
 
 `<query>` is Everything syntax, verbatim — `ext:md dm:today`, `path:C:\NEW\`, `size:>1mb`,
 `!draft`, `a|b`, `"exact phrase"`, `regex:^foo` — anything Everything accepts. Empty = every item.
@@ -87,7 +101,7 @@ QUERY  ext:md dm:last3days
 
 ## The window
 
-`facet --gui [query]`, or double-click `facetw.exe`, is the same engine with a rail you click:
+`facet --gui [query]`, double-click `facetw.exe`, or type *facet* in the Start Menu after `facet --shortcut` — the same engine with a rail you click:
 
 - **Query box** — Everything syntax, verbatim; the search re-runs as you type (260 ms after the
   last key), Enter runs it now.
@@ -97,7 +111,7 @@ QUERY  ext:md dm:last3days
   compile into the query in the status line and the whole thing is re-run through Everything,
   so every count is Everything's. `×` removes a chip, Esc clears them all. Right-click a `not …`
   chip to pin it as a standing exclude: it is kept in `facet.ini` next to the exe and applied on
-  every launch — the noise list that keeps itself. Section headers fold and unfold.
+  every launch — the noise list that keeps itself (`--ini PATH` keeps a second profile). Section headers fold and unfold.
 - **Results** — the rows, newest first; click a column to sort (Everything sorts, the list is
   re-fetched); double-click or Enter opens a row; right-click: open its folder, copy its path,
   only / exclude its folder; Delete excludes the selected row's folder; Ctrl+C copies the path.
@@ -150,7 +164,7 @@ files}, burst_gap_s}`. Every bucket's / burst's `query` is the Everything term s
 append it to `compiled` to drill in. Exit codes: 0 ok · 1 bad arguments · 2 Everything
 unreachable / IPC error (JSON still emitted with `error`) · 3 selftest failed.
 
-## Speed (reference box: 7.1 M items indexed, Everything 1.4.1.1026, i9 / NVMe)
+## Speed (reference box: 7.1 M items indexed, Everything 1.4.1.1026, i9-9900K)
 
 | query                     | items      | wall      |
 |---------------------------|-----------:|----------:|
@@ -172,14 +186,15 @@ Files: `everything_ipc.h` (the IPC contract: QUERY2 / LIST2 / ITEM2, request fla
 `es_client.h/.cpp` (the collector: reply window, paging, parser; OS glue) · `facets.h/.cpp` (the
 fold: directory trie, extensions, buckets, bursts, retained rows) · `query.h` (the compiler:
 picks → Everything syntax) · `app_util.h` (options, formatting, Unicode-width columns) ·
-`facet.cpp` (report, list, count, JSON, MCP, selftest) · `facet_gui.cpp` (the window) ·
-`facet.rc` + `facet.manifest` (version info, PerMonitorV2 DPI, UTF-8 code page, long paths) ·
+`facet.cpp` (report, list, count, JSON, MCP, where, selftest) · `facet_gui.cpp` (the window,
+the icon, the shortcut) · `facet.ico` (exported by `facet --make-icon`, embedded by the .rc) ·
+`facet.rc` + `facet.manifest` (icon, version info, PerMonitorV2 DPI, UTF-8 code page, long paths) ·
 `docs/devlog.md` (decisions and measurements as they happened).
 
 ## Known limits
 
-- Everything must be running (the GUI instance; the service alone has no IPC window). facet
-  says so and exits 2 otherwise.
+- Everything must be installed; the service alone has no IPC window, so facet starts the tray
+  instance itself when needed (see above) and exits 2 with the install hint otherwise.
 - Everything 1.4 answers one page per WM_COPYDATA; facet streams pages of `--page` items
   (65,536). The database is live, so two passes seconds apart can differ by a few items.
 - *in the future* and *no date* buckets have no query term; Everything 1.4 has no `dm:` form

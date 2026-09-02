@@ -1,6 +1,7 @@
 #include <windows.h>
 
 1 RT_MANIFEST "facet.manifest"
+1 ICON "facet.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 0,1,0,0

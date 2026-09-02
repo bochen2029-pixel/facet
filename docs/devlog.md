@@ -87,3 +87,22 @@ Running notes, newest at the bottom. Decisions, measurements, test results.
   the table has focus is forwarded to the query box; `-n` caps the window's pass like the CLI.
 - C:\Everything\README.md (the AI-session locator doc) now points at facet for the "where did
   the matches go" question, so future sessions find it without being told.
+
+## 2026-09-02 · Everything found / started / explained · the app icon · Start Menu entry
+
+- Bo's first run from a fresh PowerShell hit "Everything is not running" (only the -svc service
+  was up; the tray instance that owns the IPC window was not). Now connect() looks for
+  Everything.exe (override / FACET_EVERYTHING → registry App Paths + Uninstall keys, both views
+  → Program Files / LocalAppData\Programs / scoop / chocolatey → PATH), starts it with -startup
+  (tray only), waits for the IPC window and for IsDbLoaded, notes it on stderr (or the window's
+  tally) and carries on. --no-start turns it off. On this box the 1.4 x86 installer left
+  InstallLocation + DisplayIcon under the WOW6432Node Uninstall key; that is what facet reads.
+- Nothing installed anywhere → the error is a paragraph: what Everything is, the download page,
+  run it once so it indexes, or point facet at a portable copy. -j puts the same text in "error".
+- Everything 1.5 alpha runs as a named instance whose IPC window is
+  EVERYTHING_TASKBAR_NOTIFICATION_(1.5a); connect() tries both classes.
+- facet --make-icon writes the runtime icon as a .ico (ICONDIR + 32-bpp DIBs, opaque AND mask,
+  16…256 px); facet.rc embeds it so Explorer and the Start Menu show it. facet --shortcut writes
+  a .lnk (IShellLinkW) to facetw.exe --gui into the Start Menu (or the desktop), which is how
+  the window becomes "type facet in Start" like Everything itself.
+- Published: github.com/bochen2029-pixel/facet (public, MIT), release v0.1.0 with the two exes.

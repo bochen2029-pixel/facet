@@ -21,6 +21,8 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <objidl.h>   // IStream / PROPID for gdiplus.h, which WIN32_LEAN_AND_MEAN leaves out
+#include <shlobj.h>   // SHGetKnownFolderPath (the Start Menu / desktop folders)
+#include <shobjidl.h> // IShellLinkW (the shortcut)
 
 #include <algorithm>
 #include <atomic>
@@ -129,6 +131,8 @@ struct Gui {
     std::unique_ptr<Result> res;
     bool busy = false;
     std::wstring compiled;      // of the latest submit
+    std::wstring note;          // from the worker ("starting Everything…"), guarded by lock
+    std::wstring busy_note;     // the UI's copy, shown in the tally while busy
     // views
     std::vector<RailRow> rail;
     std::vector<std::wstring> collapsed;   // rail sections folded by clicking their header
@@ -147,6 +151,7 @@ struct Gui {
 Gui* g = nullptr;
 
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
+constexpr UINT WM_APP_NOTE = WM_APP + 2;
 constexpr UINT_PTR kDebounceTimer = 1, kShotTimer = 2, kProgressTimer = 3;
 constexpr int kEditId = 100;
 constexpr uint32_t kRowsCap = 200000;
@@ -168,7 +173,20 @@ void make_fonts(Gui& s) {
     if (s.edit) SendMessageW(s.edit, WM_SETFONT, (WPARAM)s.fTitle, TRUE);
 }
 
-// The icon: a facet rail — three bars of falling length — generated at runtime, nothing to ship.
+// The icon: a facet rail — three bars of falling length. Drawn at runtime for the window and
+// exported by `facet --make-icon facet.ico` for the .rc, so Explorer and the Start Menu show it too.
+void draw_icon_pixels(int sz, std::vector<uint32_t>& p) {
+    p.assign((size_t)sz * (size_t)sz, 0xFF14141A);
+    auto put = [&](int x0, int y0, int x1, int y1, uint32_t argb) {
+        for (int y = std::max(0, y0); y < std::min(sz, y1); ++y)
+            for (int x = std::max(0, x0); x < std::min(sz, x1); ++x) p[(size_t)y * sz + x] = argb;
+    };
+    const int gp = std::max(1, sz / 12), h = (sz - 4 * gp) / 3;
+    put(gp, gp, sz - gp, gp + h, 0xFF5CA4EE);                                    // blue: the big one
+    put(gp, 2 * gp + h, gp + (sz - 2 * gp) * 3 / 5, 2 * gp + 2 * h, 0xFFF4B442);   // amber
+    put(gp, 3 * gp + 2 * h, gp + (sz - 2 * gp) / 3, 3 * gp + 3 * h, 0xFF40C76A);   // green
+}
+
 HICON make_icon(int sz) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -180,16 +198,9 @@ HICON make_icon(int sz) {
     void* bits = nullptr;
     HBITMAP color = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     if (!color || !bits) return nullptr;
-    auto* p = (uint32_t*)bits;
-    auto put = [&](int x0, int y0, int x1, int y1, uint32_t argb) {
-        for (int y = std::max(0, y0); y < std::min(sz, y1); ++y)
-            for (int x = std::max(0, x0); x < std::min(sz, x1); ++x) p[y * sz + x] = argb;
-    };
-    put(0, 0, sz, sz, 0xFF14141A);
-    const int gp = std::max(1, sz / 12), h = (sz - 4 * gp) / 3;
-    put(gp, gp, sz - gp, gp + h, 0xFF5CA4EE);                              // blue: the big one
-    put(gp, 2 * gp + h, gp + (sz - 2 * gp) * 3 / 5, 2 * gp + 2 * h, 0xFFF4B442);   // amber
-    put(gp, 3 * gp + 2 * h, gp + (sz - 2 * gp) / 3, 3 * gp + 3 * h, 0xFF40C76A); // green
+    std::vector<uint32_t> px;
+    draw_icon_pixels(sz, px);
+    memcpy(bits, px.data(), px.size() * sizeof(uint32_t));
     HBITMAP mask = CreateBitmap(sz, sz, 1, 1, nullptr);
     ICONINFO ii{};
     ii.fIcon = TRUE;
@@ -295,6 +306,14 @@ void shell_reveal(HWND h, const std::wstring& path) {
 DWORD WINAPI worker(LPVOID) {
     Gui& s = *g;
     Everything es;
+    es.launch.allow_start = !s.opts.no_start;
+    es.launch.exe_override = s.opts.everything_exe;
+    es.on_note = [&s](const std::string& n) {
+        AcquireSRWLockExclusive(&s.lock);
+        s.note = widen(n);
+        ReleaseSRWLockExclusive(&s.lock);
+        if (s.hwnd) PostMessageW(s.hwnd, WM_APP_NOTE, 0, 0);
+    };
     for (;;) {
         Request r;
         AcquireSRWLockExclusive(&s.lock);
@@ -603,7 +622,8 @@ void paint(Gui& s, HDC dc, RECT client) {
         std::wstring tally;
         if (s.busy) {
             const uint64_t done = s.progress_items.load(), tot = s.progress_total.load();
-            tally = tot ? L"searching…  " + widen(fmt_count(done)) + L" of " + widen(fmt_count(tot)) : L"searching…";
+            if (!s.busy_note.empty() && !tot) tally = s.busy_note;
+            else tally = tot ? L"searching…  " + widen(fmt_count(done)) + L" of " + widen(fmt_count(tot)) : L"searching…";
         } else if (s.res && !s.res->err.empty()) tally = L"! " + widen(s.res->err);
         else if (f) tally = widen(fmt_count(s.res->total)) + L" items · " + widen(ssprintf("%.0f ms", s.res->ms));
         RECT tr = rect(s.rcTop.right - px(s, 250), s.rcTop.top, s.rcTop.right - m, s.rcTop.bottom);
@@ -874,6 +894,7 @@ void on_result(Gui& s, Result* raw) {
     if (r->gen != s.gen.load()) return;   // a newer request is on its way
     s.res = std::move(r);
     s.busy = false;
+    s.busy_note.clear();
     s.sel = -1;
     s.hover_row = -1;
     s.stable.pos = 0;
@@ -950,12 +971,19 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             // typing while the table has focus goes to the query box
             if (wp >= 0x20 && wp != 0x7F && GetFocus() == h) {
                 SetFocus(s.edit);
-                SendMessageW(s.edit, EM_SETSEL, (WPARAM)-1, -1);
+                const LRESULT len = SendMessageW(s.edit, WM_GETTEXTLENGTH, 0, 0);
+                SendMessageW(s.edit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
                 SendMessageW(s.edit, WM_CHAR, wp, lp);
             }
             return 0;
         case WM_APP_RESULT:
             on_result(s, (Result*)lp);
+            return 0;
+        case WM_APP_NOTE:
+            AcquireSRWLockExclusive(&s.lock);
+            s.busy_note = s.note;
+            ReleaseSRWLockExclusive(&s.lock);
+            InvalidateRect(h, &s.rcTop, FALSE);
             return 0;
         case WM_PAINT: {
             PAINTSTRUCT ps;
@@ -1184,15 +1212,18 @@ int run_gui(const Opts& o) {
     state.query = o.query;
     state.sort = o.sort;
     state.ascending = o.ascending;
-    state.ini = exe_dir() + L"facet.ini";
+    state.ini = o.ini.empty() ? exe_dir() + L"facet.ini" : widen(o.ini);
     int x = CW_USEDEFAULT, y = CW_USEDEFAULT, w = 0, hgt = 0;
     ini_load(state, x, y, w, hgt);
     for (auto& d : o.exclude) { Chip c; c.f = { Filter::Kind::DirOut, d }; c.group = "dir"; c.label = chip_label(c.f); state.chips.push_back(c); }
     for (auto& d : o.include) { Chip c; c.f = { Filter::Kind::DirIn, d }; c.group = "dir"; c.label = chip_label(c.f); state.chips.push_back(c); }
     for (auto& e : o.ext) { Chip c; c.f = { Filter::Kind::ExtIn, e }; c.group = "ext"; c.label = chip_label(c.f); state.chips.push_back(c); }
     for (auto& c : state.chips) c.label = chip_label(c.f);
-    state.icon_big = make_icon(32);
-    state.icon_small = make_icon(16);
+    const HINSTANCE hinst = GetModuleHandleW(nullptr);
+    state.icon_big = (HICON)LoadImageW(hinst, MAKEINTRESOURCEW(1), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+    state.icon_small = (HICON)LoadImageW(hinst, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR);
+    if (!state.icon_big) state.icon_big = make_icon(32);      // no icon resource: draw it
+    if (!state.icon_small) state.icon_small = make_icon(16);
 
     WNDCLASSW wc{};
     wc.style = CS_DBLCLKS;
@@ -1229,7 +1260,10 @@ int run_gui(const Opts& o) {
     }
     ShowWindow(state.hwnd, SW_SHOW);
     SetFocus(state.edit);
-    SendMessageW(state.edit, EM_SETSEL, (WPARAM)-1, -1);
+    {
+        const LRESULT len = SendMessageW(state.edit, WM_GETTEXTLENGTH, 0, 0);   // caret at the end, not at 0
+        SendMessageW(state.edit, EM_SETSEL, (WPARAM)len, (LPARAM)len);
+    }
     state.thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
     submit(state);
     update_title(state);
@@ -1243,6 +1277,104 @@ int run_gui(const Opts& o) {
     if (state.edit_brush) DeleteObject(state.edit_brush);
     if (state.icon_big) DestroyIcon(state.icon_big);
     if (state.icon_small) DestroyIcon(state.icon_small);
+    return 0;
+}
+
+// --make-icon FILE.ico: the runtime icon at every size Windows asks for, as a plain .ico
+// (ICONDIR + one 32-bpp DIB per size with an all-opaque AND mask). The .rc embeds the file.
+int write_icon_file(const std::string& path) {
+    const int sizes[] = { 16, 20, 24, 32, 40, 48, 64, 256 };
+    const uint16_t n = (uint16_t)std::size(sizes);
+    std::vector<uint8_t> out;
+    auto w16 = [&](uint16_t v) { out.push_back((uint8_t)(v & 0xFF)); out.push_back((uint8_t)(v >> 8)); };
+    w16(0);   // reserved
+    w16(1);   // type: icon
+    w16(n);
+    const size_t dir_at = out.size();
+    out.resize(dir_at + 16u * n);
+    for (uint16_t i = 0; i < n; ++i) {
+        const int sz = sizes[i];
+        std::vector<uint32_t> px;
+        draw_icon_pixels(sz, px);
+        const size_t start = out.size();
+        const uint32_t mask_stride = (((uint32_t)sz + 31) / 32) * 4;
+        BITMAPINFOHEADER bih{};
+        bih.biSize = sizeof bih;
+        bih.biWidth = sz;
+        bih.biHeight = sz * 2;   // XOR + AND
+        bih.biPlanes = 1;
+        bih.biBitCount = 32;
+        bih.biSizeImage = (DWORD)((uint32_t)sz * (uint32_t)sz * 4 + mask_stride * (uint32_t)sz);
+        const auto* hb = reinterpret_cast<const uint8_t*>(&bih);
+        out.insert(out.end(), hb, hb + sizeof bih);
+        for (int y = sz - 1; y >= 0; --y) {   // XOR bitmap: bottom-up rows of BGRA
+            const auto* row = reinterpret_cast<const uint8_t*>(px.data() + (size_t)y * (size_t)sz);
+            out.insert(out.end(), row, row + (size_t)sz * 4);
+        }
+        out.insert(out.end(), (size_t)mask_stride * (size_t)sz, (uint8_t)0);   // AND mask: opaque
+        const uint32_t bytes = (uint32_t)(out.size() - start), off = (uint32_t)start;
+        uint8_t* e = out.data() + dir_at + 16u * i;
+        e[0] = (uint8_t)(sz == 256 ? 0 : sz);
+        e[1] = e[0];
+        e[2] = 0;   // colours (0 = no palette)
+        e[3] = 0;   // reserved
+        e[4] = 1; e[5] = 0;    // planes
+        e[6] = 32; e[7] = 0;   // bits per pixel
+        memcpy(e + 8, &bytes, 4);
+        memcpy(e + 12, &off, 4);
+    }
+    FILE* f = _wfopen(widen(path).c_str(), L"wb");
+    if (!f) {
+        fprintf(stderr, "facet: cannot write %s\n", path.c_str());
+        return 1;
+    }
+    fwrite(out.data(), 1, out.size(), f);
+    fclose(f);
+    printf("facet: wrote %s (%zu bytes, %u sizes)\n", path.c_str(), out.size(), (unsigned)n);
+    return 0;
+}
+
+// --shortcut [startmenu|desktop]: a .lnk to the window (facetw.exe --gui), so "facet" is one
+// Start-Menu keystroke away and can be pinned to the taskbar from there.
+int make_shortcut(const std::string& where) {
+    wchar_t self_buf[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(nullptr, self_buf, (DWORD)std::size(self_buf));
+    const std::wstring self(self_buf, n);
+    const std::wstring dir = exe_dir();
+    std::wstring target = dir + L"facetw.exe";
+    if (GetFileAttributesW(target.c_str()) == INVALID_FILE_ATTRIBUTES) target = self;
+    const bool desktop = where == "desktop";
+    PWSTR folder = nullptr;
+    if (FAILED(SHGetKnownFolderPath(desktop ? FOLDERID_Desktop : FOLDERID_Programs, 0, nullptr, &folder))) {
+        fprintf(stderr, "facet: cannot resolve the %s folder\n", desktop ? "desktop" : "Start Menu");
+        return 1;
+    }
+    const std::wstring lnk = std::wstring(folder) + L"\\facet.lnk";
+    CoTaskMemFree(folder);
+    const HRESULT hi = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    IShellLinkW* sl = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&sl));
+    if (SUCCEEDED(hr)) {
+        sl->SetPath(target.c_str());
+        sl->SetArguments(L"--gui");
+        sl->SetWorkingDirectory(dir.c_str());
+        sl->SetIconLocation(target.c_str(), 0);
+        sl->SetDescription(L"facet - pivot filtering over Everything's index");
+        IPersistFile* pf = nullptr;
+        hr = sl->QueryInterface(IID_PPV_ARGS(&pf));
+        if (SUCCEEDED(hr)) {
+            hr = pf->Save(lnk.c_str(), TRUE);
+            pf->Release();
+        }
+        sl->Release();
+    }
+    if (SUCCEEDED(hi)) CoUninitialize();
+    if (FAILED(hr)) {
+        fprintf(stderr, "facet: could not write %s (0x%08lx)\n", narrow(lnk).c_str(), (unsigned long)hr);
+        return 1;
+    }
+    printf("facet: shortcut written  %s  ->  %s --gui\n  %s\n", narrow(lnk).c_str(), narrow(target).c_str(),
+           desktop ? "double-click it on the desktop" : "type  facet  in the Start Menu; right-click it there to pin it to the taskbar");
     return 0;
 }
 

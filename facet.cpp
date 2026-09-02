@@ -17,7 +17,9 @@
 
 namespace facet {
 
-int run_gui(const Opts& o);   // facet_gui.cpp
+int run_gui(const Opts& o);                    // facet_gui.cpp
+int write_icon_file(const std::string& path);  // facet_gui.cpp: the app icon as a .ico (the .rc embeds it)
+int make_shortcut(const std::string& where);   // facet_gui.cpp: Start Menu / desktop .lnk to the window
 
 // ======================================================================
 // JSON emit
@@ -321,6 +323,14 @@ static std::vector<Filter> filters_from(const Opts& o) {
     if (o.files_only) fs.push_back({ Filter::Kind::Term, L"file:" });
     if (o.folders_only) fs.push_back({ Filter::Kind::Term, L"folder:" });
     return fs;
+}
+
+// Every mode reaches Everything the same way: start it when it is only not running (unless
+// --no-start), point at a specific exe when told, and put the notes on stderr.
+static void configure(Everything& es, const Opts& o) {
+    es.launch.allow_start = !o.no_start;
+    es.launch.exe_override = o.everything_exe;
+    es.on_note = [](const std::string& n) { fprintf(stderr, "facet: %s\n", n.c_str()); };
 }
 
 // ======================================================================
@@ -705,6 +715,7 @@ static int fail(const std::string& err, bool json, const Opts& o, const std::wst
 static int run_report(Opts o) {
     if (!o.json) console_setup(o);
     Everything es;
+    configure(es, o);
     FacetConfig cfg;
     cfg.burst_gap_s = (uint32_t)o.burst_gap_s;
     cfg.top_bursts = (uint32_t)o.bursts;
@@ -727,6 +738,7 @@ static int run_list(Opts o) {
     const uint32_t cap = o.max_set ? o.max_rows : 200;
     o.max_rows = cap;
     Everything es;
+    configure(es, o);
     FacetConfig cfg;
     cfg.keep_rows = cap ? cap : 0xFFFFFFFFu;
     cfg.top_bursts = 0;
@@ -764,6 +776,7 @@ static int run_list(Opts o) {
 
 static int run_count(const Opts& o) {
     Everything es;
+    configure(es, o);
     const std::wstring compiled = compile(o.query, filters_from(o));
     uint32_t total = 0;
     std::string err;
@@ -771,6 +784,39 @@ static int run_count(const Opts& o) {
     if (o.json) write_out("{\"tool\":\"facet\",\"query\":" + jw(o.query) + ",\"compiled\":" + jw(compiled) + ",\"total\":" + jn(total) + "}\n");
     else write_out(std::to_string(total) + "\n");
     return 0;
+}
+
+// --where: what facet would talk to — the exe it found, whether an instance is up, what is indexed
+static int run_where(const Opts& o) {
+    const std::wstring exe = find_everything_exe(o.everything_exe);
+    Everything es;
+    es.launch.allow_start = false;
+    es.launch.exe_override = o.everything_exe;
+    std::string err;
+    const bool up = es.connect(&err);
+    const EsInfo& i = es.info();
+    if (o.json) {
+        std::string j = "{\"tool\":\"facet\",\"version\":" + jstr(kVersion) + ",\"everything_exe\":" + (exe.empty() ? std::string("null") : jw(exe)) +
+                        std::string(",\"running\":") + (up ? "true" : "false");
+        if (up)
+            j += ",\"everything\":" + jstr(i.version()) + std::string(",\"db_loaded\":") + (i.db_loaded ? "true" : "false") +
+                 ",\"size_indexed\":" + (i.size_indexed ? "true" : "false") + ",\"modified_indexed\":" + (i.modified_indexed ? "true" : "false") +
+                 ",\"created_indexed\":" + (i.created_indexed ? "true" : "false");
+        else
+            j += ",\"error\":" + jstr(err);
+        j += ",\"download\":\"https://www.voidtools.com/downloads/\"}\n";
+        write_out(j);
+        return up ? 0 : 2;
+    }
+    printf("Everything.exe   %s\n", exe.empty() ? "(none found)" : narrow(exe).c_str());
+    if (up)
+        printf("running          yes - %s, database %s, indexed: size %s, date-modified %s, date-created %s\n"
+               "IPC              ok (WM_COPYDATA QUERY2 - the same channel es.exe uses)\n",
+               i.version().c_str(), i.db_loaded ? "loaded" : "still loading", i.size_indexed ? "yes" : "no",
+               i.modified_indexed ? "yes" : "no", i.created_indexed ? "yes" : "no (facet never asks for it)");
+    else
+        printf("running          no\n  %s\n", err.c_str());
+    return up ? 0 : 2;
 }
 
 // ======================================================================
@@ -860,9 +906,10 @@ static void mcp_common_opts(const JV* a, Opts& o) {
     o.json = true;
 }
 
-static int run_mcp() {
+static int run_mcp(const Opts& base) {
     std::string line;
     Everything es;
+    configure(es, base);
     while (std::getline(std::cin, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
@@ -1080,9 +1127,18 @@ static int run_selftest(const Opts& opts) {
         check(jparse("{\"a\":[1,\"x\",{\"b\":null}],\"c\":true}", v) && v.get("a") && v.get("a")->arr.size() == 3, "mini JSON parser");
     }
 
+    // ---- finding Everything
+    {
+        const std::wstring exe = find_everything_exe(opts.everything_exe);
+        check(!exe.empty(), exe.empty() ? std::string("find_everything_exe: none found") : "find_everything_exe: " + narrow(exe));
+        check(find_everything_exe(L"C:\\no\\such\\Everything.exe").empty(), "find_everything_exe honours a bad override (empty)");
+        check(strstr(everything_install_hint(), "voidtools.com/downloads") != nullptr, "install hint carries the download link");
+    }
+
     // ---- live
     {
         Everything es;
+        configure(es, opts);
         std::string err;
         const bool up = es.connect(&err);
         check(up, up ? "Everything reachable: " + es.info().version() : "Everything: " + err);
@@ -1185,7 +1241,9 @@ USAGE
   facet -c <query>         match count only
   facet -j <query>         JSON for agents (with -l: JSON rows; with -c: JSON count)
   facet --gui [query]      the window (facetw.exe opens it with no console — pin it)
+  facet --shortcut         put "facet" in the Start Menu (type facet in Start; pin from there) · --shortcut desktop
   facet --mcp              MCP stdio server — tools: facet_query, facet_list, facet_count
+  facet --where            which Everything.exe facet found, whether it is running, what is indexed
   facet --selftest         parser, fold, compiler, formatting, and live IPC checks
 
 <query> is Everything syntax, verbatim: ext:md dm:today · path:C:\NEW\ · size:>1mb · !draft ·
@@ -1208,7 +1266,18 @@ SHAPE
   -n, --max N          scan at most N items (0 = all; facets need all)
   -s, --sort K         list order: modified | name | path | size | ext   -a ascending
   --plain              no colors / ASCII bars     -q  no progress on stderr
+  --no-start           never start Everything (by default facet finds Everything.exe and starts
+                       it tray-only when no instance is running, then waits for the database)
+  --everything-exe P   the Everything.exe to use (or FACET_EVERYTHING=P) — portable installs
+  --ini P              the window's settings file: standing excludes + placement (default facet.ini
+                       next to the exe) — a second profile, or a scratch one for tests
   -h, --help           this text                  -v  version
+
+EVERYTHING
+  facet needs the running Everything instance (1.4, or the 1.5 alpha's named instance). Not
+  running but installed → facet starts it (-startup, tray only) and says so on stderr. Not
+  installed at all → facet says what it is, where to get it (voidtools.com/downloads) and what
+  to do; with -j the same text is in "error", so an agent can relay it. facet --where shows both.
 
 READING THE REPORT
   DIRECTORIES  where the matches live, ranked; a chain like C:\Users\user\ collapses when it
@@ -1263,6 +1332,18 @@ int app_main(int argc, wchar_t** argv) {
         else if (a == "--gui") o.mode = Opts::Mode::Gui;
         else if (a == "--mcp") o.mode = Opts::Mode::Mcp;
         else if (a == "--selftest") o.mode = Opts::Mode::Selftest;
+        else if (a == "--where") o.mode = Opts::Mode::Where;
+        else if (a == "--make-icon") { o.mode = Opts::Mode::MakeIcon; o.out_file = narrow(need_str(argc, argv, i, "--make-icon")); }
+        else if (a == "--shortcut") {
+            o.mode = Opts::Mode::Shortcut;
+            if (i + 1 < argc) {
+                const std::string v = narrow(argv[i + 1]);
+                if (v == "desktop" || v == "startmenu") { o.out_file = v; ++i; }
+            }
+        }
+        else if (a == "--ini") o.ini = narrow(need_str(argc, argv, i, "--ini"));
+        else if (a == "--no-start") o.no_start = true;
+        else if (a == "--everything-exe") o.everything_exe = need_str(argc, argv, i, "--everything-exe");
         else if (a == "-h" || a == "--help" || a == "/?") o.mode = Opts::Mode::Help;
         else if (a == "-v" || a == "--version") o.mode = Opts::Mode::Version;
         else if (a == "-x" || a == "--exclude") o.exclude.push_back(need_str(argc, argv, i, "-x"));
@@ -1308,7 +1389,10 @@ int app_main(int argc, wchar_t** argv) {
             printf(kHelp, kVersion);
             return 0;
         case Opts::Mode::Version: printf("facet %s\n", kVersion); return 0;
-        case Opts::Mode::Mcp: return run_mcp();
+        case Opts::Mode::Mcp: return run_mcp(o);
+        case Opts::Mode::Where: return run_where(o);
+        case Opts::Mode::MakeIcon: return write_icon_file(o.out_file);
+        case Opts::Mode::Shortcut: return make_shortcut(o.out_file);
         case Opts::Mode::Selftest: { console_setup(o); return run_selftest(o); }
         case Opts::Mode::List: return run_list(o);
         case Opts::Mode::Count: return run_count(o);
