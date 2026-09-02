@@ -13,7 +13,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cwctype>
+#include <fcntl.h>
+#include <io.h>
 #include <iostream>
+#include <unordered_set>
 
 namespace facet {
 
@@ -334,42 +338,285 @@ static void configure(Everything& es, const Opts& o) {
 }
 
 // ======================================================================
-// the pass: compile → stream → fold
+// tapes: paths in, paths out — the pipe contract shared with everywhere and everywhen.
+// A tape is one path per line (LF or CRLF; a NUL-separated list is detected), or JSONL whose
+// objects carry "path" or "file". Comments (#), blanks and duplicates are dropped; order kept.
+// ======================================================================
+struct Tape {
+    std::vector<std::wstring> paths;   // unique, backslashed, no trailing separator
+    size_t records = 0, dups = 0, bad = 0;
+    bool nul = false;
+};
+
+// the identity of a path in a set: case-folded, backslashed, no \\?\ prefix, no trailing separator
+static std::wstring norm_key(std::wstring p) {
+    for (auto& c : p) c = (c == L'/') ? L'\\' : (wchar_t)towlower(c);
+    if (p.rfind(L"\\\\?\\", 0) == 0) p.erase(0, 4);
+    while (p.size() > 3 && p.back() == L'\\') p.pop_back();
+    return p;
+}
+static std::wstring tidy_path(std::wstring p) {
+    for (auto& c : p)
+        if (c == L'/') c = L'\\';
+    while (p.size() > 3 && p.back() == L'\\') p.pop_back();
+    return p;
+}
+
+static bool read_bytes(const std::string& spec, std::string& out, std::string* err) {
+    FILE* f = stdin;
+    if (spec == "-") {
+        _setmode(_fileno(stdin), _O_BINARY);
+    } else {
+        f = _wfopen(widen(spec).c_str(), L"rb");
+        if (!f) {
+            if (err) *err = "cannot read " + spec;
+            return false;
+        }
+    }
+    char buf[1 << 16];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) out.append(buf, n);
+    if (f != stdin) fclose(f);
+    return true;
+}
+
+static void parse_tape(const std::string& bytes, Tape& t) {
+    t.nul = bytes.find('\0') != std::string::npos;
+    const char sep = t.nul ? '\0' : '\n';
+    std::unordered_set<std::wstring> seen;
+    size_t i = (bytes.size() >= 3 && (unsigned char)bytes[0] == 0xEF && (unsigned char)bytes[1] == 0xBB && (unsigned char)bytes[2] == 0xBF) ? 3 : 0;
+    while (i < bytes.size()) {
+        size_t j = bytes.find(sep, i);
+        if (j == std::string::npos) j = bytes.size();
+        std::string_view rec(bytes.data() + i, j - i);
+        i = j + 1;
+        while (!rec.empty() && (rec.back() == '\r' || rec.back() == ' ' || rec.back() == '\t')) rec.remove_suffix(1);
+        while (!rec.empty() && (rec.front() == ' ' || rec.front() == '\t')) rec.remove_prefix(1);
+        if (rec.empty() || rec.front() == '#') continue;
+        t.records++;
+        std::string path;
+        if (rec.front() == '{') {
+            JV v;
+            if (!jparse(std::string(rec), v) || v.t != JV::Obj) { t.bad++; continue; }
+            const JV* p = v.get("path");
+            if (!p || p->t != JV::Str) p = v.get("file");
+            if (!p || p->t != JV::Str || p->s.empty()) { t.bad++; continue; }
+            path = p->s;
+        } else {
+            path = std::string(rec);
+        }
+        std::wstring w = tidy_path(widen(path));
+        if (w.empty()) { t.bad++; continue; }
+        if (!seen.insert(norm_key(w)).second) { t.dups++; continue; }
+        t.paths.push_back(std::move(w));
+    }
+}
+
+static bool load_tape(const std::string& spec, Tape& t, std::string* err) {
+    std::string bytes;
+    if (!read_bytes(spec, bytes, err)) return false;
+    parse_tape(bytes, t);
+    return true;
+}
+
+// (base ∩ and…) ∪ or… − not…   — and narrows, or widens, not removes
+struct TapeOps {
+    bool have_and = false;
+    std::unordered_set<std::wstring> and_keys, not_keys;
+    std::vector<std::wstring> or_paths;
+    bool active() const { return have_and || !not_keys.empty() || !or_paths.empty(); }
+    bool pass(const std::wstring& key) const {
+        if (have_and && !and_keys.count(key)) return false;
+        return !not_keys.count(key);
+    }
+};
+
+static bool load_ops(const Opts& o, TapeOps& ops, std::string* err) {
+    std::unordered_set<std::wstring> or_seen;
+    for (const auto& [op, spec] : o.tape_ops) {
+        Tape t;
+        if (!load_tape(spec, t, err)) return false;
+        if (op == '&') {
+            std::unordered_set<std::wstring> keys;
+            for (const auto& p : t.paths) keys.insert(norm_key(p));
+            if (!ops.have_and) {
+                ops.and_keys = std::move(keys);
+                ops.have_and = true;
+            } else {
+                for (auto it = ops.and_keys.begin(); it != ops.and_keys.end();)
+                    it = keys.count(*it) ? std::next(it) : ops.and_keys.erase(it);
+            }
+        } else if (op == '-') {
+            for (const auto& p : t.paths) ops.not_keys.insert(norm_key(p));
+        } else {
+            for (const auto& p : t.paths)
+                if (or_seen.insert(norm_key(p)).second) ops.or_paths.push_back(p);
+        }
+    }
+    return true;
+}
+
+// one stat per path: what Everything would have told us, from the file system. False = missing
+// (the item is still folded, with unknown size and date, so the tape's shape stays complete).
+static bool stat_item(const std::wstring& p, std::wstring& name, std::wstring& dir, EsItem& it) {
+    const size_t pos = p.find_last_of(L'\\');
+    name = pos == std::wstring::npos ? p : p.substr(pos + 1);
+    dir = pos == std::wstring::npos ? std::wstring() : p.substr(0, pos);
+    it = EsItem{};
+    it.name = name.c_str();
+    it.name_len = (uint32_t)name.size();
+    it.path = dir.c_str();
+    it.path_len = (uint32_t)dir.size();
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad)) return false;
+    it.folder = (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    it.size = it.folder ? kUnknown64 : (((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow);
+    it.mtime = ((uint64_t)fad.ftLastWriteTime.dwHighDateTime << 32) | fad.ftLastWriteTime.dwLowDateTime;
+    if (it.mtime == 0) it.mtime = kUnknown64;
+    return true;
+}
+
+// Every full path of the base set (a tape, or an Everything query) after the tape ops, in order.
+// Streams: nothing is retained, so the whole disk fits.
+static bool walk_paths(const Opts& o, const std::function<void(const std::wstring&)>& emit, std::wstring& compiled, std::string& err) {
+    TapeOps ops;
+    if (!load_ops(o, ops, &err)) return false;
+    const bool track = !ops.or_paths.empty();
+    std::unordered_set<std::wstring> base_keys;
+    uint64_t n = 0;
+    if (!o.files_from.empty()) {
+        Tape t;
+        if (!load_tape(o.files_from, t, &err)) return false;
+        for (const auto& p : t.paths) {
+            const std::wstring key = norm_key(p);
+            if (!ops.pass(key)) continue;
+            if (track) base_keys.insert(key);
+            emit(p);
+            if (o.max_rows && ++n >= o.max_rows) break;
+        }
+    } else {
+        Everything es;
+        configure(es, o);
+        compiled = compile(o.query, filters_from(o));
+        const uint32_t sort = o.sort_set ? ipc_sort(o.sort, o.ascending) : (uint32_t)ipc::NameAsc;
+        std::wstring full;
+        const bool ok = es.query(compiled, sort, 0, o.max_rows, o.page, ipc::kReqName | ipc::kReqPath,
+                                 [&](const EsPage&, const EsItem* it, uint32_t k) {
+                                     for (uint32_t i = 0; i < k; ++i) {
+                                         full.assign(it[i].path, it[i].path_len);
+                                         full += L'\\';
+                                         full.append(it[i].name, it[i].name_len);
+                                         if (ops.active()) {
+                                             const std::wstring key = norm_key(full);
+                                             if (!ops.pass(key)) continue;
+                                             if (track) base_keys.insert(key);
+                                         }
+                                         emit(full);
+                                     }
+                                     return true;
+                                 }, &err);
+        if (!ok) return false;
+    }
+    for (const auto& p : ops.or_paths) {
+        const std::wstring key = norm_key(p);
+        if (base_keys.count(key) || ops.not_keys.count(key)) continue;
+        emit(p);
+    }
+    return true;
+}
+
+// ======================================================================
+// the pass: compile → stream → fold   (or: tape → stat → fold)
 // ======================================================================
 struct Run {
     std::wstring compiled;
     EsInfo info;
     double ms = 0;
     std::string err;
-    uint32_t total = 0;      // Everything's match count for the compiled query
+    uint32_t total = 0;      // Everything's match count for the compiled query (after tape ops: the fold's count)
+    std::string source = "everything";   // or "tape"
+    std::string spec;        // the tape's name
+    size_t tape_paths = 0, tape_missing = 0, tape_records = 0, tape_dups = 0, tape_bad = 0;
+    bool ops_active = false;
 };
 
-static bool run_pass(const Opts& o, Everything& es, Facets& f, Run& r) {
-    r.compiled = compile(o.query, filters_from(o));
+static bool run_pass(const Opts& o, Everything& es, Facets& f, Run& r, const Tape* inline_tape = nullptr) {
     const double t0 = now_ms();
-    const uint32_t req = ipc::kReqName | ipc::kReqPath | ipc::kReqSize | ipc::kReqModified;
-    // rows retained → the caller's order matters; facets only → the index's own order is cheapest
-    const uint32_t sort = f.config().keep_rows ? ipc_sort(o.sort, o.ascending) : (uint32_t)ipc::NameAsc;
-    const bool progress = !o.quiet && stderr_is_console();
-    ULONGLONG last = GetTickCount64();
-    bool shown = false;
-    auto sink = [&](const EsPage& pg, const EsItem* items, uint32_t n) -> bool {
-        r.total = pg.total;
-        for (uint32_t i = 0; i < n; ++i) f.add(items[i]);
-        if (progress) {
-            const ULONGLONG now = GetTickCount64();
-            if (now - last > 700) {
-                fprintf(stderr, "\r  facet: %s of %s items...", fmt_count(f.items).c_str(), fmt_count(pg.total).c_str());
-                shown = true;
-                last = now;
-            }
-        }
-        return true;
+    TapeOps ops;
+    if (!load_ops(o, ops, &r.err)) return false;
+    r.ops_active = ops.active();
+    const bool track = !ops.or_paths.empty();
+    std::unordered_set<std::wstring> base_keys;
+    auto fold_path = [&](const std::wstring& p) {
+        std::wstring name, dir;
+        EsItem it;
+        if (!stat_item(p, name, dir, it)) r.tape_missing++;
+        f.add(it);
+        r.tape_paths++;
     };
-    const bool ok = es.query(r.compiled, sort, 0, o.max_rows, o.page, req, sink, &r.err);
-    if (shown) fputs("\r                                                      \r", stderr);
+    bool ok = true;
+    if (inline_tape || !o.files_from.empty()) {
+        Tape local;
+        const Tape* t = inline_tape;
+        if (!t) {
+            if (!load_tape(o.files_from, local, &r.err)) return false;
+            t = &local;
+        }
+        r.source = "tape";
+        r.spec = inline_tape ? "(paths)" : o.files_from;
+        r.tape_records = t->records;
+        r.tape_dups = t->dups;
+        r.tape_bad = t->bad;
+        for (const auto& p : t->paths) {
+            const std::wstring key = norm_key(p);
+            if (!ops.pass(key)) continue;
+            if (track) base_keys.insert(key);
+            fold_path(p);
+            if (o.max_rows && f.items >= o.max_rows) break;
+        }
+    } else {
+        r.compiled = compile(o.query, filters_from(o));
+        const uint32_t req = ipc::kReqName | ipc::kReqPath | ipc::kReqSize | ipc::kReqModified;
+        // rows retained → the caller's order matters; facets only → the index's own order is cheapest
+        const uint32_t sort = f.config().keep_rows ? ipc_sort(o.sort, o.ascending) : (uint32_t)ipc::NameAsc;
+        const bool progress = !o.quiet && stderr_is_console();
+        ULONGLONG last = GetTickCount64();
+        bool shown = false;
+        std::wstring full;
+        auto sink = [&](const EsPage& pg, const EsItem* items, uint32_t n) -> bool {
+            r.total = pg.total;
+            for (uint32_t i = 0; i < n; ++i) {
+                if (ops.active()) {
+                    full.assign(items[i].path, items[i].path_len);
+                    full += L'\\';
+                    full.append(items[i].name, items[i].name_len);
+                    const std::wstring key = norm_key(full);
+                    if (!ops.pass(key)) continue;
+                    if (track) base_keys.insert(key);
+                }
+                f.add(items[i]);
+            }
+            if (progress) {
+                const ULONGLONG now = GetTickCount64();
+                if (now - last > 700) {
+                    fprintf(stderr, "\r  facet: %s of %s items...", fmt_count(f.items).c_str(), fmt_count(pg.total).c_str());
+                    shown = true;
+                    last = now;
+                }
+            }
+            return true;
+        };
+        ok = es.query(r.compiled, sort, 0, o.max_rows, o.page, req, sink, &r.err);
+        if (shown) fputs("\r                                                      \r", stderr);
+        r.info = es.info();
+    }
+    for (const auto& p : ops.or_paths) {
+        const std::wstring key = norm_key(p);
+        if (base_keys.count(key) || ops.not_keys.count(key)) continue;
+        fold_path(p);
+    }
+    if (r.source == "tape" || ops.active()) r.total = (uint32_t)std::min<uint64_t>(f.items, 0xFFFFFFFFu);
     f.finish();
-    r.info = es.info();
     r.ms = now_ms() - t0;
     return ok;
 }
@@ -541,12 +788,20 @@ static std::string render_report(const Facets& f, const Opts& o, const Run& r, c
     out += kVersion;
     out += R;
     out += "  ";
-    out += o.query.empty() ? std::string("(everything)") : narrow(o.query);
+    if (r.source == "tape") out += "tape: " + r.spec;
+    else out += o.query.empty() ? std::string("(everything)") : narrow(o.query);
     out += "\n";
     out += D;
     out += ssprintf("%s items · %s files · %s folders · %s", fmt_count(f.items).c_str(), fmt_count(f.files).c_str(),
                     fmt_count(f.folders).c_str(), human_bytes(f.bytes).c_str());
-    out += ssprintf(" · Everything %s · %.0f ms", r.info.version().c_str(), r.ms);
+    if (r.source == "tape") {
+        out += ssprintf(" · %s paths, %s missing", fmt_count(r.tape_paths).c_str(), fmt_count(r.tape_missing).c_str());
+        if (r.tape_dups) out += ssprintf(", %s duplicate records dropped", fmt_count(r.tape_dups).c_str());
+        if (r.tape_bad) out += ssprintf(", %s unreadable", fmt_count(r.tape_bad).c_str());
+        out += ssprintf(" · %.0f ms", r.ms);
+    } else {
+        out += ssprintf(" · Everything %s · %.0f ms", r.info.version().c_str(), r.ms);
+    }
     out += R;
     out += "\n";
     if (r.total > f.items) {
@@ -568,11 +823,14 @@ static std::string render_report(const Facets& f, const Opts& o, const Run& r, c
     }
     out += "\n";
     out += B;
-    out += "QUERY";
+    out += r.source == "tape" ? "TAPE " : "QUERY";
     out += R;
-    out += "  " + narrow(r.compiled) + "\n";
+    out += "  " + (r.source == "tape" ? r.spec : narrow(r.compiled));
+    for (const auto& [op, spec] : o.tape_ops) out += std::string(op == '&' ? "  ∩ " : op == '|' ? "  ∪ " : "  − ") + spec;
+    out += "\n";
     out += D;
-    out += "       -x DIR excludes a subtree · -i DIR drills in · -e md;txt · --since 3d · --flat 2 · -l rows · -j JSON";
+    out += r.source == "tape" ? "       --paths prints a result set as a tape · --and / --or / --not F combine tapes · everywhere --files-from - scans one"
+                              : "       -x DIR excludes a subtree · -i DIR drills in · -e md;txt · --since 3d · --flat 2 · -l rows · -j JSON · --paths for pipes";
     out += R;
     out += "\n";
     return out;
@@ -618,6 +876,16 @@ static std::string report_json(const Facets& f, const Opts& o, const Run& r) {
     j += ",\"bytes\":" + jn(f.bytes) + ",\"unknown_size\":" + jn(f.unknown_size) + ",\"last_hour\":" + jn(f.last_hour);
     j += ssprintf(",\"elapsed_ms\":%.1f", r.ms);
     j += ",\"error\":" + (r.err.empty() ? std::string("null") : jstr(r.err));
+    j += ",\"source\":" + jstr(r.source);
+    if (r.source == "tape")
+        j += ",\"tape\":{\"spec\":" + jstr(r.spec) + ",\"paths\":" + jn(r.tape_paths) + ",\"missing\":" + jn(r.tape_missing) +
+             ",\"records\":" + jn(r.tape_records) + ",\"duplicates\":" + jn(r.tape_dups) + ",\"bad\":" + jn(r.tape_bad) + "}";
+    j += ",\"ops\":[";
+    for (size_t i = 0; i < o.tape_ops.size(); ++i) {
+        if (i) j += ",";
+        j += std::string("{\"op\":\"") + (o.tape_ops[i].first == '&' ? "and" : o.tape_ops[i].first == '|' ? "or" : "not") + "\",\"file\":" + jstr(o.tape_ops[i].second) + "}";
+    }
+    j += "]";
     const uint64_t thr = fold_threshold(o, f.items);
     j += ",\"directories\":[";
     if (o.flat) {
@@ -774,7 +1042,36 @@ static int run_list(Opts o) {
     return 0;
 }
 
+// --paths: the result set as a tape — one full path per line (-0: NUL), nothing else, streamed
+static int run_paths(const Opts& o) {
+    const char sep = o.nul ? '\0' : '\n';
+    std::string buf;
+    uint64_t n = 0;
+    std::wstring compiled;
+    std::string err;
+    const bool ok = walk_paths(o, [&](const std::wstring& p) {
+        buf += narrow(p);
+        buf += sep;
+        n++;
+        if (buf.size() >= (1u << 16)) { write_out(buf); buf.clear(); }
+    }, compiled, err);
+    write_out(buf);
+    fflush(stdout);
+    if (!ok) return fail(err, false, o, compiled);
+    if (!o.quiet) fprintf(stderr, "# %s paths\n", fmt_count(n).c_str());
+    return 0;
+}
+
 static int run_count(const Opts& o) {
+    if (!o.files_from.empty() || !o.tape_ops.empty()) {   // a tape, or a query combined with tapes: count what walks
+        uint64_t n = 0;
+        std::wstring compiled;
+        std::string err;
+        if (!walk_paths(o, [&](const std::wstring&) { n++; }, compiled, err)) return fail(err, o.json, o, compiled);
+        if (o.json) write_out("{\"tool\":\"facet\",\"query\":" + jw(o.query) + ",\"compiled\":" + jw(compiled) + ",\"tape\":" + jstr(o.files_from) + ",\"total\":" + jn(n) + "}\n");
+        else write_out(std::to_string(n) + "\n");
+        return 0;
+    }
     Everything es;
     configure(es, o);
     const std::wstring compiled = compile(o.query, filters_from(o));
@@ -863,7 +1160,9 @@ static const char* kToolsList =
     "\"min\":{\"type\":\"integer\",\"default\":0,\"description\":\"fold directories with fewer items (0 = 1 % of the result set)\"},"
     "\"burst_gap_s\":{\"type\":\"integer\",\"default\":60},"
     "\"bursts\":{\"type\":\"integer\",\"default\":10},"
-    "\"max\":{\"type\":\"integer\",\"default\":0,\"description\":\"scan at most this many items (0 = all)\"}"
+    "\"max\":{\"type\":\"integer\",\"default\":0,\"description\":\"scan at most this many items (0 = all)\"},"
+    "\"paths\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"fold these full paths instead of running query "
+    "(a tape, e.g. the files another tool found); query is ignored, missing files are counted\"}"
     "},\"required\":[\"query\"]}},{"
     "\"name\":\"facet_list\","
     "\"description\":\"Rows of an Everything search (full path, size, modified, folder flag), sorted by "
@@ -956,7 +1255,20 @@ static int run_mcp(const Opts& base) {
                 cfg.top_bursts = (uint32_t)o.bursts;
                 Facets f(cfg);
                 Run r;
-                const bool ok = run_pass(o, es, f, r);
+                Tape tape;
+                bool have_paths = false;
+                if (a && a->get("paths") && a->get("paths")->t == JV::Arr) {
+                    std::unordered_set<std::wstring> seen;
+                    for (const auto& pv : a->get("paths")->arr) {
+                        if (pv.t != JV::Str || pv.s.empty()) { tape.bad++; continue; }
+                        tape.records++;
+                        std::wstring w = tidy_path(widen(pv.s));
+                        if (!seen.insert(norm_key(w)).second) { tape.dups++; continue; }
+                        tape.paths.push_back(std::move(w));
+                    }
+                    have_paths = true;
+                }
+                const bool ok = run_pass(o, es, f, r, have_paths ? &tape : nullptr);
                 mcp_result(id, mcp_text(ok ? report_json(f, o, r) : r.err, !ok));
             } else if (tool == "facet_list") {
                 std::string sk = a && a->get("sort") ? a->get("sort")->as_str("modified") : "modified";
@@ -1158,6 +1470,30 @@ static int run_selftest(const Opts& opts) {
         check(jparse("{\"a\":[1,\"x\",{\"b\":null}],\"c\":true}", v) && v.get("a") && v.get("a")->arr.size() == 3, "mini JSON parser");
     }
 
+    // ---- tapes
+    {
+        Tape t;
+        parse_tape("C:/a/b.md\r\nc:\\A\\B.MD\n# comment\n\n{\"path\":\"D:\\\\x\\\\y.txt\"}\n{\"type\":\"path\",\"file\":\"E:\\\\z\"}\n{\"nope\":1}\n{bad\n", t);
+        check(t.paths.size() == 3 && t.paths[0] == L"C:\\a\\b.md" && t.paths[1] == L"D:\\x\\y.txt" && t.paths[2] == L"E:\\z" &&
+                  t.records == 6 && t.dups == 1 && t.bad == 2,
+              "tape: lines, CRLF, JSONL path/file, comments, duplicates, bad records");
+        Tape n;
+        parse_tape(std::string("C:\\p\0C:\\q\0", 9), n);
+        check(n.nul && n.paths.size() == 2 && n.paths[1] == L"C:\\q", "tape: NUL-separated input detected");
+        check(norm_key(L"\\\\?\\C:/A/B\\") == L"c:\\a\\b" && norm_key(L"C:\\") == L"c:\\" && norm_key(L"c:\\x\\") == L"c:\\x", "norm_key");
+        TapeOps ops;
+        ops.have_and = true;
+        ops.and_keys = { L"c:\\a", L"c:\\b" };
+        ops.not_keys = { L"c:\\b" };
+        check(ops.pass(L"c:\\a") && !ops.pass(L"c:\\b") && !ops.pass(L"c:\\c"), "tape ops: and narrows, not removes");
+        std::wstring name, dir;
+        EsItem it;
+        check(stat_item(L"C:\\facet\\README.md", name, dir, it) && name == L"README.md" && dir == L"C:\\facet" && !it.folder && it.size > 1000 && it.mtime != kUnknown64,
+              "stat_item: a real file");
+        check(!stat_item(L"C:\\facet\\no-such-file.md", name, dir, it) && name == L"no-such-file.md" && it.size == kUnknown64, "stat_item: a missing file still splits");
+        check(stat_item(L"C:\\facet\\docs", name, dir, it) && it.folder && it.size == kUnknown64, "stat_item: a folder");
+    }
+
     // ---- finding Everything
     {
         const std::wstring exe = find_everything_exe(opts.everything_exe);
@@ -1253,6 +1589,20 @@ static int run_selftest(const Opts& opts) {
                 }
                 JV v;
                 check(jparse(report_json(f, o, r), v) && v.get("directories") && v.get("bursts"), "report JSON parses back");
+                // tapes round-trip: the query's paths, walked, equal its count; 300 of them folded back give 300
+                uint64_t walked = 0;
+                std::wstring wc;
+                std::string werr;
+                Tape tt;
+                const bool wok = walk_paths(o, [&](const std::wstring& p) { walked++; if (tt.paths.size() < 300) tt.paths.push_back(p); }, wc, werr);
+                check(wok && walked == r.total, ssprintf("walk_paths == count (%s)", fmt_count(walked).c_str()));
+                FacetConfig tc;
+                tc.top_bursts = 1;
+                Facets tf(tc);
+                Run tr;
+                const bool fold_ok = run_pass(o, es, tf, tr, &tt);   // run first: the message below reads the numbers
+                check(fold_ok && tf.items == tt.paths.size() && tr.source == "tape" && tr.total == tt.paths.size(),
+                      ssprintf("tape fold: %llu of %zu paths, %zu missing", (unsigned long long)tf.items, tt.paths.size(), tr.tape_missing));
             }
         }
     }
@@ -1270,6 +1620,7 @@ USAGE
                            modified · size · write bursts — then the compiled query to paste
   facet -l <query>         rows (full paths), newest first; -ll adds size + date; -n caps (200)
   facet -c <query>         match count only
+  facet --paths <query>    the result set as a tape: one full path per line, nothing else (-0: NUL)
   facet -j <query>         JSON for agents (with -l: JSON rows; with -c: JSON count)
   facet --gui [query]      the window (facetw.exe opens it with no console — pin it)
   facet --shortcut         put "facet" in the Start Menu (type facet in Start; pin from there) · --shortcut desktop
@@ -1309,6 +1660,14 @@ EVERYTHING
   running but installed → facet starts it (-startup, tray only) and says so on stderr. Not
   installed at all → facet says what it is, where to get it (voidtools.com/downloads) and what
   to do; with -j the same text is in "error", so an agent can relay it. facet --where shows both.
+
+TAPES (paths in, paths out — the pipe contract facet shares with everywhere and everywhen)
+  --paths              print the result set's full paths, one per line, streamed (no facets)
+  --files-from F|-     fold a path list instead of a query: plain lines (LF/CRLF/NUL) or JSONL
+                       with "path" or "file"; comments (#) and duplicates dropped; missing counted
+  --and F  --or F  --not F   set algebra over tapes: (base ∩ and…) ∪ or… − not…   (repeatable)
+  -0, --null           NUL-separated paths out (input is auto-detected)
+  facet --paths -x C:\vendor ext:md dm:last7days | everywhere --files-from - -e join -l | facet --files-from -
 
 READING THE REPORT
   DIRECTORIES  where the matches live, ranked; a chain like C:\Users\user\ collapses when it
@@ -1359,6 +1718,12 @@ int app_main(int argc, wchar_t** argv) {
         if (a == "-l" || a == "--list") { if (o.mode == Opts::Mode::List) o.long_list = true; o.mode = Opts::Mode::List; }
         else if (a == "-ll" || a == "--long") { o.mode = Opts::Mode::List; o.long_list = true; }
         else if (a == "-c" || a == "--count") o.mode = Opts::Mode::Count;
+        else if (a == "--paths") o.mode = Opts::Mode::Paths;
+        else if (a == "-0" || a == "--null") o.nul = true;
+        else if (a == "--files-from") o.files_from = narrow(need_str(argc, argv, i, "--files-from"));
+        else if (a == "--and") o.tape_ops.emplace_back('&', narrow(need_str(argc, argv, i, "--and")));
+        else if (a == "--or") o.tape_ops.emplace_back('|', narrow(need_str(argc, argv, i, "--or")));
+        else if (a == "--not") o.tape_ops.emplace_back('-', narrow(need_str(argc, argv, i, "--not")));
         else if (a == "-j" || a == "--json") o.json = true;
         else if (a == "--gui") o.mode = Opts::Mode::Gui;
         else if (a == "--mcp") o.mode = Opts::Mode::Mcp;
@@ -1393,6 +1758,7 @@ int app_main(int argc, wchar_t** argv) {
         else if (a == "-s" || a == "--sort") {
             const std::string k = narrow(need_str(argc, argv, i, "--sort"));
             if (!parse_sort_key(k, o.sort)) { fprintf(stderr, "facet: unknown sort '%s'\n", k.c_str()); return 1; }
+            o.sort_set = true;
         }
         else if (a == "-a" || a == "--asc") o.ascending = true;
         else if (a == "--desc") o.ascending = false;
@@ -1413,6 +1779,7 @@ int app_main(int argc, wchar_t** argv) {
         return run_gui(o);
     }
     ensure_console_for_text();
+    _setmode(_fileno(stdout), _O_BINARY);   // LF-only output: tapes, JSON and rows pipe cleanly
 
     switch (o.mode) {
         case Opts::Mode::Help:
@@ -1427,6 +1794,7 @@ int app_main(int argc, wchar_t** argv) {
         case Opts::Mode::Selftest: { console_setup(o); return run_selftest(o); }
         case Opts::Mode::List: return run_list(o);
         case Opts::Mode::Count: return run_count(o);
+        case Opts::Mode::Paths: return run_paths(o);
         default: return run_report(o);
     }
 }

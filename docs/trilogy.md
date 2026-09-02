@@ -1,6 +1,8 @@
 # The trilogy — everything · everywhere · everywhen, one pipe
 
-*Brainstorm, 2026-09-02. Not built. The seams that exist are marked; the rest is proposal.*
+*Brainstorm 2026-09-02, morning. **Shape A is built the same day** (facet 0.3.0, everywhen
+with `--paths` / `--json` / `locate`; everywhere already spoke the contract): pipelines 1, 2 and
+3 below run as written, with measured numbers in the facet README. B, C and D remain proposals.*
 
 ## The three axes
 

@@ -206,11 +206,40 @@ the icon, the shortcut) · `facet.ico` (exported by `facet --make-icon`, embedde
   for "unknown".
 - Windows only, by construction — the whole point is the WDDM-era MFT index Everything keeps.
 
-## Next: the trilogy
+## Tapes: the pipe between everything, everywhere and everywhen
 
-`facet` (names, and where they went) · `everywhere` (contents, at drive speed) · `everywhen`
-(sessions, message-grain) compose through one path tape — the brainstorm, the pipelines it
-unlocks, and the order to build it in are in [docs/trilogy.md](docs/trilogy.md).
+A **tape** is a list of full paths — one per line (LF, CRLF or NUL-separated), or JSONL whose
+objects carry `path` or `file`. facet writes one with `--paths` and reads one with
+`--files-from`; `C:\everywhere` reads one with `--files-from -` and writes one with `-l` or
+`--jsonl`; `C:\everywhen` writes one with `search --paths` and resolves `path:line` back to a
+message with `locate`. Same syntax everywhere, so the three compose in a shell:
+
+```
+facet --paths <query>                 the result set as a tape, streamed (no facets computed)
+facet --files-from F|- [report opts]  fold a tape instead of a query: one stat per path, missing
+                                      files counted, duplicates and comments dropped
+--and F   --or F   --not F            set algebra: (base ∩ and…) ∪ or… − not…   (repeatable)
+-0                                    NUL-separated paths out; input is auto-detected
+```
+
+```bash
+# names → contents → where: last week's markdown minus the vendored repo, scanned for "join", folded by directory
+facet --paths -x C:\deepseek-harness-master ext:md dm:last7days | everywhere --files-from - -e join -l | facet --files-from -
+
+# sessions → tapes → contents → messages: sessions that talked about facet and also say vramtop, resolved to the message
+everywhen search --hours 720 --query facet --paths | everywhere --files-from - -e vramtop --jsonl | everywhen locate - --json
+
+# contents → where: every file holding a key, by directory and write burst
+everywhere -l "API_KEY" C:\Data | facet --files-from -
+
+# algebra: today's markdown that Everything knows, minus a noise tape; or two tapes united
+facet -c ext:md dm:today --not noise.txt        facet --paths --files-from a.txt --or b.txt
+```
+
+Measured: `facet --paths` streams 382,529 paths in under a second; folding a 300-path tape takes
+3 ms; everywhere needed about four minutes to scan those 382k small files cold, so look at
+facet's tally (files, bytes) before you hand a tape to a content scan. The full design, the
+shapes considered, and what comes next are in [docs/trilogy.md](docs/trilogy.md).
 
 ## Why Everything itself does not do this
 

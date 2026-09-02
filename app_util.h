@@ -12,7 +12,7 @@
 
 namespace facet {
 
-constexpr const char* kVersion = "0.2.0";
+constexpr const char* kVersion = "0.3.0";
 constexpr uint64_t kUnknown64 = ~0ull;             // "not reported" — never confuse with 0
 constexpr uint64_t kTicksPerSec = 10000000ull;     // FILETIME resolution
 constexpr uint64_t kTicksPerDay = 864000000000ull;
@@ -20,7 +20,7 @@ constexpr uint64_t kTicksPerDay = 864000000000ull;
 enum class SortKey { Modified, Name, Path, Size, Ext, Created, Recent };
 
 struct Opts {
-    enum class Mode { Auto, Report, List, Count, Gui, Mcp, Selftest, Where, MakeIcon, Shortcut, Help, Version };
+    enum class Mode { Auto, Report, List, Count, Paths, Gui, Mcp, Selftest, Where, MakeIcon, Shortcut, Help, Version };
     Mode mode = Mode::Auto;
     bool json = false;
     std::wstring query;                    // the Everything query, verbatim
@@ -41,7 +41,12 @@ struct Opts {
     bool max_set = false;
     bool long_list = false;                // list: add size + date columns
     SortKey sort = SortKey::Modified;
+    bool sort_set = false;
     bool ascending = false;
+    // tapes: paths in, paths out — the pipe contract shared with everywhere and everywhen
+    bool nul = false;                      // -0: NUL-separated paths out (input auto-detects)
+    std::string files_from;                // --files-from FILE|-: fold this path list instead of a query
+    std::vector<std::pair<char, std::string>> tape_ops;   // ('&' --and F) ('|' --or F) ('-' --not F), in order
     bool plain = false;                    // no ANSI
     bool quiet = false;                    // no progress on stderr
     uint32_t page = 65536;                 // IPC page size

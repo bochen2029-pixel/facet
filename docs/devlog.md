@@ -125,3 +125,25 @@ Running notes, newest at the bottom. Decisions, measurements, test results.
   did nothing" was the driver's stale geometry (the chip bar is 34 logical px empty, not 30).
 - README hero is Bo's own capture (titanic, 316 items); docs/trilogy.md holds the brainstorm for
   wiring everything · everywhere · everywhen through one path tape.
+
+## 2026-09-02 · 0.3.0 — shape A: the path tape
+
+- One contract, three tools: a tape is one full path per line (LF/CRLF, NUL detected) or JSONL
+  with "path" / "file". facet: `--paths` streams a result set as a tape (382,529 paths in
+  under a second, nothing retained); `--files-from F|-` folds a tape instead of a query with
+  one GetFileAttributesEx per path (300 paths in 3 ms; missing files counted, still folded);
+  `--and / --or / --not F` do (base ∩ and…) ∪ or… − not… over case-folded, backslashed keys;
+  `-0` for NUL out; stdout is binary (LF only) in every console mode; MCP facet_query takes
+  `paths`. everywhere already reads `--files-from -` and writes `-l` / `--jsonl`
+  ({"type":"path","path":…} and {"type":"match","path":…,"line_number":…}); its paths come
+  with forward slashes and facet normalises them. everywhen gained `search --paths`, `--json`
+  and `locate` (see C:\everywhen\BUILD_LOG.md).
+- Measured pipelines: (1) `facet --paths -x … ext:md dm:last7days | everywhere --files-from -
+  -e facet -l | facet --files-from -` → 52 hits folded by directory; everywhere took ~4 min
+  cold over 382k small files, so the tally is the budget. (2) `everywhen search --paths |
+  everywhere --jsonl | everywhen locate - --json` → hits resolved to uuid/ts/role/session.
+  (3) `--not today.txt` on last3days = 1,252 − 300 = 952; `--and` = 300; `--or` dedups.
+- Selftest: tape parsing (CRLF, JSONL, comments, dups, bad, NUL), norm_key, ops, stat_item on a
+  real / missing / folder path, walk_paths == count, tape fold round-trip. Trap logged twice
+  now: a check message that reads its numbers must be built AFTER the call it reports on —
+  argument evaluation order made "tape fold: 0 paths" print for a passing check.
