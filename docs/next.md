@@ -7,6 +7,13 @@ for the agents. The candidates below are ranked by how well they fit that move o
 
 ## 1. iowho — who is writing what, right now  (recommended)
 
+> **Became everywho.** Designed in full the same day as a blueprint ready for implementation:
+> `C:\Intellect_AI_tools\everywho` (public: https://github.com/bochen2029-pixel/everywho) —
+> architecture, the ETW spec, CLI/JSON contracts, GUI and test plans, decision records, contract
+> headers. Everything below was reviewed against it; the manifest providers, the treemap,
+> files-per-minute, the handle finder (as everywho's `--open` and its open-file rundown) and
+> the process-tree provenance are folded in there. That folder is the canonical design.
+
 facet infers write bursts after the fact from modified times: "2,797 files in one minute under
 X". It cannot say *which process* did it. Windows can: the kernel's file and disk ETW providers
 (`Microsoft-Windows-Kernel-File`, `Microsoft-Windows-Kernel-Disk`) attribute every create,
