@@ -329,6 +329,82 @@ std::vector<DirLine> dir_lines(const Facets& f, const Opts& o) {
     return out;
 }
 
+std::wstring filter_term(const Filter& f) {
+    switch (f.kind) {
+        case Filter::Kind::DirIn: return dir_term(f.value);
+        case Filter::Kind::DirOut: return L"!" + dir_term(f.value);
+        case Filter::Kind::ExtIn: return L"ext:" + f.value;
+        case Filter::Kind::ExtOut: return L"!ext:" + f.value;
+        default: return f.value;
+    }
+}
+
+std::vector<Pick> column_picks(const Facets& f, const Row& r, Column col) {
+    std::vector<Pick> out;
+    auto add = [&](std::wstring label, Filter::Kind k, std::wstring value, const char* group) {
+        out.push_back({ std::move(label), { k, std::move(value) }, group });
+    };
+    switch (col) {
+        case Column::Path: {
+            std::vector<std::wstring> chain;   // deepest first: the folder itself (for a folder row), then every ancestor
+            if (r.folder) chain.push_back(f.row_path(r) + L"\\");
+            for (uint32_t n = r.dir; n != 0 && n < f.nodes.size(); n = f.nodes[n].parent) chain.push_back(f.dir_path(n));
+            for (const auto& d : chain) add(L"only  " + d, Filter::Kind::DirIn, d, "dir");
+            for (const auto& d : chain) add(L"not  " + d, Filter::Kind::DirOut, d, "dir");
+            if (!chain.empty()) {
+                const std::wstring d = r.folder ? chain[0] : f.dir_path(r.dir);
+                add(L"only the files directly in  " + d, Filter::Kind::Term, L"parent:\"" + d + L"\"", "dir");
+                add(L"not the files directly in  " + d, Filter::Kind::Term, L"!parent:\"" + d + L"\"", "dir");
+            }
+            break;
+        }
+        case Column::Name: {
+            const std::wstring name(f.row_name(r));
+            add(L"only this name", Filter::Kind::Term, L"wfn:\"" + name + L"\"", "name");
+            add(L"not this name", Filter::Kind::Term, L"!wfn:\"" + name + L"\"", "name-out");
+            const size_t dot = name.find_last_of(L'.');
+            if (!r.folder && dot != std::wstring::npos && dot > 0 && dot + 1 < name.size()) {
+                std::wstring ext = name.substr(dot + 1);
+                for (auto& c : ext) c = (wchar_t)towlower(c);
+                add(L"only ." + ext, Filter::Kind::ExtIn, ext, "ext");
+                add(L"not ." + ext, Filter::Kind::ExtOut, ext, "ext-out");
+            }
+            break;
+        }
+        case Column::Size: {
+            if (r.folder || r.size == kUnknown64) {
+                add(L"only folders", Filter::Kind::Term, L"folder:", "kind");
+                add(L"only files", Filter::Kind::Term, L"file:", "kind");
+                break;
+            }
+            const std::wstring n = std::to_wstring(r.size);
+            add(L"only exactly this size", Filter::Kind::Term, L"size:" + n, "size");
+            add(L"only this size and larger", Filter::Kind::Term, L"size:>=" + n, "size");
+            add(L"only this size and smaller", Filter::Kind::Term, L"size:<=" + n, "size");
+            const BucketStat& b = f.sizes[(size_t)Facets::size_bucket(r.size, r.folder)];
+            if (!b.query.empty()) {
+                add(L"only " + widen(b.label), Filter::Kind::Term, b.query, "size");
+                add(L"not " + widen(b.label), Filter::Kind::Term, L"!" + b.query, "size-out");
+            }
+            break;
+        }
+        case Column::Modified: {
+            if (r.mtime == kUnknown64) break;
+            const std::wstring day = widen(fmt_local_date(r.mtime));
+            const std::wstring sec = widen(fmt_filetime_iso(r.mtime));
+            const std::wstring minute = sec.substr(0, 16);
+            add(L"only this day", Filter::Kind::Term, L"dm:" + day, "mod");
+            add(L"not this day", Filter::Kind::Term, L"!dm:" + day, "mod-out");
+            add(L"only this minute", Filter::Kind::Term, L"dm:" + minute + L".." + minute, "mod");
+            add(L"not this minute", Filter::Kind::Term, L"!dm:" + minute + L".." + minute, "mod-out");
+            add(L"only this and newer", Filter::Kind::Term, L"dm:>=" + sec, "mod");
+            add(L"only this and older", Filter::Kind::Term, L"dm:<=" + sec, "mod");
+            break;
+        }
+    }
+    return out;
+}
+
 std::vector<DirLine> flat_lines(const Facets& f, const Opts& o) {
     std::vector<DirLine> all;
     for (uint32_t id = 1; id < (uint32_t)f.nodes.size(); ++id) {

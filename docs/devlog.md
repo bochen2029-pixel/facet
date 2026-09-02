@@ -106,3 +106,22 @@ Running notes, newest at the bottom. Decisions, measurements, test results.
   a .lnk (IShellLinkW) to facetw.exe --gui into the Start Menu (or the desktop), which is how
   the window becomes "type facet in Start" like Everything itself.
 - Published: github.com/bochen2029-pixel/facet (public, MIT), release v0.1.0 with the two exes.
+
+## 2026-09-02 · 0.2.0 — the cell menu: only / not by name, folder level, size, date
+
+- Bo's ask: right-click any column and exclude or keep only "this". Tightened into: the column
+  decides what "this" means, and the menu names the term it adds. Path → every folder level from
+  the file's own folder up to the drive (only + not) plus the files directly in it (`parent:`);
+  name → exact name (`wfn:"…"`) and extension; size → exact bytes, `>=`, `<=`, and the bucket;
+  modified → the day, the minute, `>=`, `<=`. All verified as Everything 1.4 terms by `facet -c`
+  (`wfn:` 1 of 316 titanic files; `size:302` 1; `dm:2026-07-12` 19; minute range 2; `!dm:` and
+  `!size:a..b` negate cleanly).
+- `column_picks()` is a pure function in facets.cpp; --selftest checks every column's terms and
+  groups. Includes on name / size / date are single-valued (a new pick replaces the old chip);
+  excludes accumulate. Chips wrap onto up to five rows; the bar grows.
+- Verification without touching a modal menu: WM_APP+7 (column, index) applies a pick to the
+  selected row; FACET_LOG=FILE makes the window log clicks, picks, submits and results. The
+  driver read back: wfn → 1, size:>= → 2, dm:day → 300, and the log showed the earlier "drill
+  did nothing" was the driver's stale geometry (the chip bar is 34 logical px empty, not 30).
+- README hero is Bo's own capture (titanic, 316 items); docs/trilogy.md holds the brainstorm for
+  wiring everything · everywhere · everywhen through one path tape.

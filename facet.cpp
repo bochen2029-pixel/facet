@@ -1102,6 +1102,37 @@ static int run_selftest(const Opts& opts) {
         uint64_t sum = 0;
         for (const auto& b : f.modified) sum += b.count;
         check(sum == 6, "every item lands in one modified bucket");
+        // the cell menu: what a right-click on x.md (C:\a\b, 100 B, t0) offers per column
+        {
+            const Row& x = f.rows[0];
+            auto terms = [&](Column c) {
+                std::vector<std::wstring> v;
+                for (const Pick& p : column_picks(f, x, c)) v.push_back(filter_term(p.f));
+                return v;
+            };
+            const auto path = terms(Column::Path);
+            check(path.size() == 8 && path[0] == L"path:\"C:\\a\\b\\\"" && path[2] == L"path:\"C:\\\"" && path[3] == L"!path:\"C:\\a\\b\\\"" &&
+                      path[6] == L"parent:\"C:\\a\\b\\\"" && path[7] == L"!parent:\"C:\\a\\b\\\"",
+                  "cell menu · path: every folder level, only + not, plus the files right here");
+            const auto name = terms(Column::Name);
+            check(name.size() == 4 && name[0] == L"wfn:\"x.md\"" && name[1] == L"!wfn:\"x.md\"" && name[2] == L"ext:md" && name[3] == L"!ext:md",
+                  "cell menu · name: exact name and extension, only + not");
+            const auto size = terms(Column::Size);
+            check(size.size() == 5 && size[0] == L"size:100" && size[1] == L"size:>=100" && size[2] == L"size:<=100" && size[3] == L"size:1..4095" &&
+                      size[4] == L"!size:1..4095",
+                  "cell menu · size: exact, bounds, bucket");
+            const auto mod = terms(Column::Modified);
+            const std::wstring day = widen(fmt_local_date(t0)), sec = widen(fmt_filetime_iso(t0));
+            check(mod.size() == 6 && mod[0] == L"dm:" + day && mod[1] == L"!dm:" + day && mod[2] == L"dm:" + sec.substr(0, 16) + L".." + sec.substr(0, 16) &&
+                      mod[4] == L"dm:>=" + sec && mod[5] == L"dm:<=" + sec,
+                  "cell menu · modified: day, minute, newer, older");
+            const auto folder_size = terms(Column::Size);
+            (void)folder_size;
+            const auto fs = column_picks(f, f.rows[5], Column::Size);
+            check(fs.size() == 2 && fs[0].f.value == L"folder:" && fs[1].f.value == L"file:", "cell menu · size on a folder: only folders / only files");
+            check(column_picks(f, x, Column::Modified)[0].group == "mod" && column_picks(f, x, Column::Name)[1].group == "name-out",
+                  "cell menu · single-valued groups");
+        }
     }
 
     // ---- the compiler

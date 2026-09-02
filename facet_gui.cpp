@@ -142,6 +142,7 @@ struct Gui {
     bool topmost = false;
     std::wstring status;
     RECT rcTop{}, rcChips{}, rcRail{}, rcHeader{}, rcTable{}, rcStatus{};
+    int chip_rows = 1;          // the chips bar grows to hold every chip (up to 5 rows)
     int col_x[5]{};             // name | path | size | modified | end
     int drag = 0;               // 1 rail thumb · 2 table thumb
     int drag_off = 0;
@@ -152,6 +153,27 @@ Gui* g = nullptr;
 
 constexpr UINT WM_APP_RESULT = WM_APP + 1;
 constexpr UINT WM_APP_NOTE = WM_APP + 2;
+constexpr UINT WM_APP_PICK = WM_APP + 7;   // test seam: wParam = column, lParam = pick index, applied to the selected row
+
+// FACET_LOG=FILE appends one line per event (clicks, picks, submits, results) — for driving the
+// window from a script and reading back what it did.
+void dbg(const char* fmt, ...) {
+    static FILE* f = nullptr;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        wchar_t buf[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableW(L"FACET_LOG", buf, MAX_PATH);
+        if (n && n < MAX_PATH) f = _wfopen(buf, L"a");
+    }
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fflush(f);
+}
 constexpr UINT_PTR kDebounceTimer = 1, kShotTimer = 2, kProgressTimer = 3;
 constexpr int kEditId = 100;
 constexpr uint32_t kRowsCap = 200000;
@@ -375,12 +397,13 @@ void submit(Gui& s) {
     ReleaseSRWLockExclusive(&s.lock);
     WakeConditionVariable(&s.cv);
     s.busy = true;
+    dbg("submit gen=%u  %s", gn, narrow(s.compiled).c_str());
     SetTimer(s.hwnd, kProgressTimer, 200, nullptr);   // repaint the tally while the pass runs
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
 void add_chip(Gui& s, const Filter& f, const std::string& group) {
-    const bool single = group == "mod" || group == "size" || group == "burst";
+    const bool single = group == "mod" || group == "size" || group == "burst" || group == "name" || group == "kind";
     for (size_t i = 0; i < s.chips.size(); ++i) {
         const Chip& c = s.chips[i];
         if (c.f.kind == f.kind && c.f.value == f.value) return;              // already there
@@ -391,6 +414,7 @@ void add_chip(Gui& s, const Filter& f, const std::string& group) {
     c.group = group;
     c.label = chip_label(f);
     s.chips.push_back(c);
+    dbg("add_chip %s  group=%s  chips=%zu", narrow(filter_term(f)).c_str(), group.c_str(), s.chips.size());
     submit(s);
 }
 
@@ -403,6 +427,7 @@ void remove_chip(Gui& s, size_t i) {
 }
 
 void clear_chips(Gui& s) {
+    dbg("clear_chips (%zu)", s.chips.size());
     std::vector<Chip> keep;
     for (const auto& c : s.chips)
         if (c.pinned) keep.push_back(c);
@@ -541,9 +566,32 @@ bool is_collapsed(const Gui& s, const std::wstring& section) {
 }
 
 // ---- layout ----
+// chips flow left to right and wrap; the bar takes as many rows as they need (5 at most)
+void layout_chips(Gui& s, int left, int right, int top) {
+    const int m = px(s, 10), ch = px(s, 20), gap = px(s, 6), rowh = ch + gap;
+    HDC dc = GetDC(s.hwnd);
+    int x = left + m, y = top + px(s, 5), rows = 1;
+    for (auto& c : s.chips) {
+        const int tw = text_width(dc, s.fSmall, (c.pinned ? L"● " : L"") + c.label) + px(s, 14) + px(s, 16);
+        if (x + tw > right - m && x > left + m) {
+            x = left + m;
+            y += rowh;
+            rows++;
+        }
+        if (rows > 5) { c.rc = RECT{}; c.rc_x = RECT{}; continue; }   // beyond the fifth row: still active, not drawn
+        c.rc = rect(x, y, x + tw, y + ch);
+        c.rc_x = rect(c.rc.right - px(s, 18), y, c.rc.right, y + ch);
+        x = c.rc.right + gap;
+    }
+    ReleaseDC(s.hwnd, dc);
+    s.chip_rows = std::min(rows, 5);
+}
+
 void layout(Gui& s, RECT client) {
-    const int topH = px(s, 46), chipH = px(s, 30), statusH = px(s, 26), headH = px(s, 26);
+    const int topH = px(s, 46), statusH = px(s, 26), headH = px(s, 26);
     s.rcTop = rect(client.left, client.top, client.right, client.top + topH);
+    layout_chips(s, client.left, client.right, s.rcTop.bottom);
+    const int chipH = std::max(px(s, 30), s.chip_rows * px(s, 26) + px(s, 8));
     s.rcChips = rect(client.left, s.rcTop.bottom, client.right, s.rcTop.bottom + chipH);
     s.rcStatus = rect(client.left, client.bottom - statusH, client.right, client.bottom);
     const int railW = std::clamp((int)(client.right - client.left) * 2 / 5, px(s, 280), px(s, 560));
@@ -630,31 +678,31 @@ void paint(Gui& s, HDC dc, RECT client) {
         draw_text(dc, s.fBold, (s.res && !s.res->err.empty()) ? kRed : kDim, tr, tally, DT_RIGHT | DT_VCENTER | DT_END_ELLIPSIS);
     }
 
-    // chips
+    // chips (laid out in layout_chips; the bar already has room for every row)
     fill(dc, s.rcChips, kPanel2);
     {
-        int x = s.rcChips.left + m;
-        const int ch = px(s, 20), cy = s.rcChips.top + (s.rcChips.bottom - s.rcChips.top - ch) / 2;
+        int hidden = 0;
         for (size_t i = 0; i < s.chips.size(); ++i) {
-            Chip& c = s.chips[i];
-            const int tw = text_width(dc, s.fSmall, c.label) + px(s, 14) + px(s, 16) + (c.pinned ? px(s, 12) : 0);
-            c.rc = rect(x, cy, x + tw, cy + ch);
-            c.rc_x = rect(c.rc.right - px(s, 18), cy, c.rc.right, cy + ch);
+            const Chip& c = s.chips[i];
+            if (c.rc.bottom == 0) { hidden++; continue; }
             const bool out = c.f.kind == Filter::Kind::DirOut || c.f.kind == Filter::Kind::ExtOut ||
                              (c.f.kind == Filter::Kind::Term && !c.f.value.empty() && c.f.value[0] == L'!');
             COLORREF bg = out ? kChipOut : kChipIn;
             if ((int)i == s.hover_chip) bg = mix(bg, RGB(255, 255, 255), 0.12);
             fill(dc, c.rc, bg);
-            RECT lr = rect(c.rc.left + px(s, 7), cy, c.rc_x.left, cy + ch);
+            RECT lr = rect(c.rc.left + px(s, 7), c.rc.top, c.rc_x.left, c.rc.bottom);
             draw_text(dc, s.fSmall, kText, lr, (c.pinned ? L"● " : L"") + c.label, DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
             draw_text(dc, s.fSmall, kDim, c.rc_x, L"×", DT_CENTER | DT_VCENTER);
-            x = c.rc.right + px(s, 6);
-            if (x > s.rcChips.right - px(s, 40)) break;
+        }
+        if (hidden) {
+            RECT hr = rect(s.rcChips.right - px(s, 160), s.rcChips.bottom - px(s, 24), s.rcChips.right - m, s.rcChips.bottom);
+            draw_text(dc, s.fSmall, kDim, hr, L"+" + std::to_wstring(hidden) + L" more (Esc clears)", DT_RIGHT | DT_VCENTER);
         }
         if (s.chips.empty()) {
-            RECT hr = rect(x, s.rcChips.top, s.rcChips.right - m, s.rcChips.bottom);
+            RECT hr = rect(s.rcChips.left + m, s.rcChips.top, s.rcChips.right - m, s.rcChips.bottom);
             draw_text(dc, s.fSmall, kDim, hr,
-                      L"no filters — click a facet to drill in, right-click to exclude; picks become chips here and compile into the query below",
+                      L"no filters — click a facet to drill in, right-click to exclude; right-click any cell in the table for only / not by "
+                      L"name, folder, size or date; picks become chips here and compile into the query below",
                       DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
         }
     }
@@ -860,37 +908,78 @@ void set_sort(Gui& s, SortKey k) {
     submit(s);
 }
 
-void context_menu(Gui& s, POINT screen) {
-    if (s.sel < 0) return;
+// The column under x: name | path | size | modified
+Column column_at(const Gui& s, int x) {
+    if (x < s.col_x[1]) return Column::Name;
+    if (x < s.col_x[2]) return Column::Path;
+    if (x < s.col_x[3]) return Column::Size;
+    return Column::Modified;
+}
+
+// Right-click on a cell: open / copy, then "only …" and "not …" for what that column shows —
+// every folder level for the path, the exact name or extension, the exact size / bounds /
+// bucket, the day / minute / newer / older. Each entry shows the Everything term it adds.
+void context_menu(Gui& s, POINT screen, Column col) {
+    if (s.sel < 0 || !s.res || !s.res->f) return;
+    const Facets& f = *s.res->f;
+    const Row& r = f.rows[(size_t)s.sel];
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING, kMenuOpen, L"Open\tEnter");
     AppendMenuW(menu, MF_STRING, kMenuOpenFolder, L"Open containing folder");
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuCopyPath, L"Copy full path\tCtrl+C");
     AppendMenuW(menu, MF_STRING, kMenuCopyName, L"Copy name");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuDrill, (L"Only this folder:  " + sel_dir(s)).c_str());
-    AppendMenuW(menu, MF_STRING, kMenuExclude, (L"Exclude this folder:  " + sel_dir(s)).c_str());
-    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, s.hwnd, nullptr);
-    DestroyMenu(menu);
-    switch (cmd) {
-        case kMenuOpen: shell_open(s.hwnd, sel_path(s)); break;
-        case kMenuOpenFolder: shell_reveal(s.hwnd, sel_path(s)); break;
-        case kMenuCopyPath: copy_text(s.hwnd, sel_path(s)); s.status = L"copied  " + sel_path(s); break;
-        case kMenuCopyName: {
-            const Row& r = s.res->f->rows[(size_t)s.sel];
-            copy_text(s.hwnd, std::wstring(s.res->f->row_name(r)));
-            break;
+    const std::vector<Pick> picks = column_picks(f, r, col);
+    constexpr UINT kPickBase = 100;
+    if (col == Column::Path) {
+        HMENU only = CreatePopupMenu(), notm = CreatePopupMenu();
+        for (size_t i = 0; i < picks.size(); ++i) {
+            const Pick& p = picks[i];
+            if (p.f.kind == Filter::Kind::DirIn) AppendMenuW(only, MF_STRING, kPickBase + (UINT)i, (dir_prefix(p.f.value) + L"\t" + filter_term(p.f)).c_str());
+            else if (p.f.kind == Filter::Kind::DirOut) AppendMenuW(notm, MF_STRING, kPickBase + (UINT)i, (dir_prefix(p.f.value) + L"\t" + filter_term(p.f)).c_str());
         }
-        case kMenuDrill: add_chip(s, { Filter::Kind::DirIn, sel_dir(s) }, "dir"); break;
-        case kMenuExclude: add_chip(s, { Filter::Kind::DirOut, sel_dir(s) }, "dir"); break;
-        default: break;
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)only, L"only this folder, or one above it");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)notm, L"not this folder, or one above it");
+        for (size_t i = 0; i < picks.size(); ++i)
+            if (picks[i].f.kind == Filter::Kind::Term)
+                AppendMenuW(menu, MF_STRING, kPickBase + (UINT)i, (picks[i].label + L"\t" + filter_term(picks[i].f)).c_str());
+    } else {
+        static const wchar_t* what[4] = { L"name", L"path", L"size", L"modified" };
+        std::wstring value;
+        if (col == Column::Name) value = std::wstring(f.row_name(r));
+        else if (col == Column::Size) value = r.folder ? L"folder" : widen(human_bytes(r.size)) + L"  (" + std::to_wstring(r.size) + L" bytes)";
+        else value = widen(fmt_filetime(r.mtime));
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, (std::wstring(what[(int)col]) + L":  " + value).c_str());
+        for (size_t i = 0; i < picks.size(); ++i)
+            AppendMenuW(menu, MF_STRING, kPickBase + (UINT)i, (picks[i].label + L"\t" + filter_term(picks[i].f)).c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, kMenuDrill, (L"only this folder\t" + dir_term(sel_dir(s))).c_str());
+        AppendMenuW(menu, MF_STRING, kMenuExclude, (L"not this folder\t!" + dir_term(sel_dir(s))).c_str());
+    }
+    const int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, 0, s.hwnd, nullptr);
+    DestroyMenu(menu);   // takes the submenus with it
+    dbg("menu col=%d picks=%zu cmd=%d", (int)col, picks.size(), cmd);
+    if (cmd >= (int)kPickBase && cmd - (int)kPickBase < (int)picks.size()) {
+        const Pick& p = picks[(size_t)(cmd - (int)kPickBase)];
+        add_chip(s, p.f, p.group);
+    } else {
+        switch (cmd) {
+            case kMenuOpen: shell_open(s.hwnd, sel_path(s)); break;
+            case kMenuOpenFolder: shell_reveal(s.hwnd, sel_path(s)); break;
+            case kMenuCopyPath: copy_text(s.hwnd, sel_path(s)); s.status = L"copied  " + sel_path(s); break;
+            case kMenuCopyName: copy_text(s.hwnd, std::wstring(f.row_name(r))); break;
+            case kMenuDrill: add_chip(s, { Filter::Kind::DirIn, sel_dir(s) }, "dir"); break;
+            case kMenuExclude: add_chip(s, { Filter::Kind::DirOut, sel_dir(s) }, "dir"); break;
+            default: break;
+        }
     }
     InvalidateRect(s.hwnd, nullptr, FALSE);
 }
 
 void on_result(Gui& s, Result* raw) {
     std::unique_ptr<Result> r(raw);
+    dbg("result gen=%u total=%u rows=%zu err=%s %s", r->gen, r->total, r->f ? r->f->rows.size() : (size_t)0, r->err.c_str(),
+        r->gen != s.gen.load() ? "(stale, dropped)" : "");
     if (r->gen != s.gen.load()) return;   // a newer request is on its way
     s.res = std::move(r);
     s.busy = false;
@@ -1029,7 +1118,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             else if (hrow >= 0) {
                 const Row& r = s.res->f->rows[(size_t)hrow];
                 st = s.res->f->row_path(r) + L"   ·   " + (r.folder ? L"folder" : widen(human_bytes(r.size))) + L"   ·   " + widen(fmt_filetime(r.mtime)) +
-                     L"   ·   double-click opens · right-click for more";
+                     L"   ·   double-click opens · right-click a cell: only / not this name, folder level, size or date";
             } else if (hc >= 0) st = L"× removes this filter   ·   right-click pins it as a standing exclude (kept in facet.ini)";
             else if (hcol >= 0) st = L"click to sort by this column (Everything sorts; the list is re-fetched)";
             if (hr != s.hover_rail || hrow != s.hover_row || hc != s.hover_chip || hcol != s.hover_col || st != s.status) {
@@ -1051,8 +1140,18 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 InvalidateRect(h, nullptr, FALSE);
             }
             return 0;
+        case WM_APP_PICK: {
+            if (s.sel >= 0 && s.res && s.res->f && s.sel < (int)s.res->f->rows.size()) {
+                const std::vector<Pick> picks = column_picks(*s.res->f, s.res->f->rows[(size_t)s.sel], (Column)std::clamp((int)wp, 0, 3));
+                dbg("pick col=%d index=%d of %zu", (int)wp, (int)lp, picks.size());
+                if ((size_t)lp < picks.size()) add_chip(s, picks[(size_t)lp].f, picks[(size_t)lp].group);
+            }
+            return 0;
+        }
         case WM_LBUTTONDOWN: {
             const POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            dbg("lbutton (%ld,%ld) rail=%d row=%d chip=%d col=%d thumb=%d/%d track=%d/%d", p.x, p.y, hit_rail(s, p), hit_row(s, p), hit_chip(s, p), hit_col(s, p),
+                PtInRect(&s.srail.thumb, p), PtInRect(&s.stable.thumb, p), PtInRect(&s.srail.track, p), PtInRect(&s.stable.track, p));
             SetFocus(h);
             if (PtInRect(&s.srail.thumb, p)) { s.drag = 1; s.drag_off = p.y - s.srail.thumb.top; SetCapture(h); return 0; }
             if (PtInRect(&s.stable.thumb, p)) { s.drag = 2; s.drag_off = p.y - s.stable.thumb.top; SetCapture(h); return 0; }
@@ -1093,6 +1192,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         case WM_RBUTTONDOWN: {
             const POINT p = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+            dbg("rbutton (%ld,%ld) rail=%d row=%d chip=%d", p.x, p.y, hit_rail(s, p), hit_row(s, p), hit_chip(s, p));
             SetFocus(h);
             const int hc = hit_chip(s, p);
             if (hc >= 0) {
@@ -1117,7 +1217,7 @@ LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 InvalidateRect(h, nullptr, FALSE);
                 POINT sp = p;
                 ClientToScreen(h, &sp);
-                context_menu(s, sp);
+                context_menu(s, sp, column_at(s, p.x));
             }
             return 0;
         }

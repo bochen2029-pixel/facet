@@ -18,7 +18,7 @@ Single ~0.5 MB exe. C/C++ only, OS APIs only, zero dependencies, no installer, n
 DLL. The index stays Everything's: facet speaks its WM_COPYDATA IPC (the channel `es.exe` uses),
 streams the result in pages, and folds them into facets with bounded memory.
 
-![facet — the rail you click, the chips it compiles, the rows Everything returns](docs/screenshot.png)
+![facet in use — the rail you click, the chips it compiles, the rows Everything returns](docs/screenshot-in-use.png)
 
 ## Use
 
@@ -113,12 +113,17 @@ QUERY  ext:md dm:last3days
   chip to pin it as a standing exclude: it is kept in `facet.ini` next to the exe and applied on
   every launch — the noise list that keeps itself (`--ini PATH` keeps a second profile). Section headers fold and unfold.
 - **Results** — the rows, newest first; click a column to sort (Everything sorts, the list is
-  re-fetched); double-click or Enter opens a row; right-click: open its folder, copy its path,
-  only / exclude its folder; Delete excludes the selected row's folder; Ctrl+C copies the path.
+  re-fetched); double-click or Enter opens a row; Delete excludes the selected row's folder;
+  Ctrl+C copies the path. **Right-click any cell** and the column decides what "this" means:
+  the *path* cell offers *only* / *not* for every folder level from the file's own folder up to
+  the drive, plus the files directly in it; the *name* cell the exact name (`wfn:`) and the
+  extension; the *size* cell the exact size, "this and larger", "this and smaller", and the
+  size bucket; the *modified* cell the day, the minute, "this and newer", "this and older".
+  Every entry shows the Everything term it adds, and it lands as a chip like any other pick.
 - Keys: Ctrl+L query · Esc clear filters · F5 rerun · Ctrl+Shift+C copy the compiled query ·
   Ctrl+T pin on top.
-- `--shot FILE.png` renders the window once, saves it and exits — the screenshot above was
-  taken that way, no hands.
+- `--shot FILE.png` renders the window once, saves it and exits — [docs/screenshot.png](docs/screenshot.png)
+  was taken that way, no hands.
 
 Everything streams on a worker thread with its own IPC window; the tally counts up while a long
 pass runs (the whole disk takes ~10 s), and a new keystroke cancels the pass in flight at its
@@ -200,6 +205,12 @@ the icon, the shortcut) · `facet.ico` (exported by `facet --make-icon`, embedde
 - *in the future* and *no date* buckets have no query term; Everything 1.4 has no `dm:` form
   for "unknown".
 - Windows only, by construction — the whole point is the WDDM-era MFT index Everything keeps.
+
+## Next: the trilogy
+
+`facet` (names, and where they went) · `everywhere` (contents, at drive speed) · `everywhen`
+(sessions, message-grain) compose through one path tape — the brainstorm, the pipelines it
+unlocks, and the order to build it in are in [docs/trilogy.md](docs/trilogy.md).
 
 ## Why Everything itself does not do this
 

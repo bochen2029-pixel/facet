@@ -10,6 +10,7 @@
 
 #include "app_util.h"
 #include "es_client.h"
+#include "query.h"
 
 namespace facet {
 
@@ -93,11 +94,12 @@ public:
     std::wstring_view row_name(const Row& r) const;
     const FacetConfig& config() const { return cfg_; }
 
+    static int size_bucket(uint64_t size, bool folder);   // index into sizes[]
+
 private:
     uint32_t dir_node(std::wstring_view p);
     uint32_t ext_slot(std::wstring_view e);
     int mod_bucket(uint64_t mtime) const;
-    static int size_bucket(uint64_t size, bool folder);
 
     FacetConfig cfg_;
     std::unordered_map<std::wstring, uint32_t, WHash, WEq> index_;
@@ -127,5 +129,15 @@ std::wstring collapsed_label(const Facets& f, uint32_t& cur, bool full_prefix);
 std::vector<DirLine> dir_lines(const Facets& f, const Opts& o);
 // --flat N: every prefix at depth N (plus the files of shallower directories), ranked
 std::vector<DirLine> flat_lines(const Facets& f, const Opts& o);
+
+// ---- what a right-click on a results cell offers: the column decides what "this value" means ----
+enum class Column { Name = 0, Path = 1, Size = 2, Modified = 3 };
+struct Pick {
+    std::wstring label;         // "only this day"
+    Filter f;                   // what it adds
+    std::string group;          // single-valued groups (mod, size, name, kind) replace the previous pick
+};
+std::vector<Pick> column_picks(const Facets& f, const Row& r, Column col);
+std::wstring filter_term(const Filter& f);   // the Everything term one filter compiles to
 
 }  // namespace facet
