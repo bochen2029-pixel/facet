@@ -31,6 +31,7 @@ struct Opts {
     bool files_only = false, folders_only = false;
     int top = 12;                          // rows per facet
     int depth = 3;                         // directory tree: levels expanded below the top entries
+    bool top_set = false, depth_set = false;   // given explicitly (the window picks tighter defaults otherwise)
     int flat = 0;                          // --flat N: flat prefix list at depth N instead of a tree
     int min_count = 1;                     // hide facet rows with fewer items
     bool min_set = false;                  // --min given: use it verbatim instead of the 1 % rule

@@ -15,7 +15,7 @@ if errorlevel 1 (
   call "!VCV!" >nul
 )
 set CXXFLAGS=/nologo /c /std:c++20 /O2 /W4 /permissive- /EHsc /utf-8 /MT /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS
-set LIBS=user32.lib gdi32.lib shell32.lib ole32.lib
+set LIBS=user32.lib gdi32.lib gdiplus.lib shell32.lib ole32.lib
 cl %CXXFLAGS% facet.cpp facet_gui.cpp es_client.cpp facets.cpp || exit /b 1
 rc /nologo /fo facet.res facet.rc || exit /b 1
 link /nologo /SUBSYSTEM:CONSOLE /OUT:facet.exe facet.obj facet_gui.obj es_client.obj facets.obj facet.res %LIBS% || exit /b 1

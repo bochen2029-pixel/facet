@@ -378,100 +378,7 @@ static std::string share_str(uint64_t part, uint64_t whole) {
     return p >= 99.95 ? "100%" : ssprintf("%.1f%%", p);
 }
 
-// rows below this are folded into "+N more": --min verbatim, else 1 % of the result set
-static uint64_t fold_threshold(const Opts& o, uint64_t items) {
-    if (o.min_set) return (uint64_t)o.min_count;
-    return std::max<uint64_t>((uint64_t)o.min_count, (items + 99) / 100);
-}
-
-struct DirLine {
-    int level = 0;
-    std::string label;
-    uint64_t count = 0, bytes = 0;
-    bool has_bytes = true;
-    bool note = false;       // a fold / files-here line, dim
-    uint32_t node = 0;
-};
-
-// "a\b\c\" — a chain of single children with nothing of their own collapses to one label
-static std::wstring collapsed_label(const Facets& f, uint32_t& cur, bool full_prefix) {
-    std::wstring label = full_prefix ? f.dir_path(cur) : (f.nodes[cur].name + L"\\");
-    while (f.nodes[cur].children.size() == 1 && f.nodes[cur].self == 0) {
-        cur = f.nodes[cur].children[0];
-        label += f.nodes[cur].name + L"\\";
-    }
-    return label;
-}
-
-static void expand_dir(const Facets& f, const Opts& o, uint32_t node, int level, uint64_t thr, std::vector<DirLine>& out) {
-    if (level > o.depth) return;
-    const DirNode& n = f.nodes[node];
-    if (n.children.empty()) return;
-    int shown = 0, rest_n = 0;
-    uint64_t rest = 0;
-    for (uint32_t c : n.children) {
-        const uint64_t cnt = f.nodes[c].count;
-        if (cnt < thr || shown >= o.top) { rest_n++; rest += cnt; continue; }
-        shown++;
-        uint32_t cur = c;
-        const std::wstring label = collapsed_label(f, cur, false);
-        out.push_back({ level, narrow(label), f.nodes[cur].count, f.nodes[cur].bytes, true, false, cur });
-        expand_dir(f, o, cur, level + 1, thr, out);
-    }
-    if (n.self > 0 && shown > 0) out.push_back({ level, "(files right here)", n.self, 0, false, true, node });
-    if (rest_n) out.push_back({ level, ssprintf("+%d more %s", rest_n, rest_n == 1 ? "directory" : "directories"), rest, 0, false, true, 0 });
-}
-
-// top entries are drive + first folder, ranked across drives (a lone "C:\ 100%" line says nothing)
-static std::vector<DirLine> dir_lines(const Facets& f, const Opts& o) {
-    std::vector<DirLine> out;
-    struct Top { uint32_t node; uint64_t count; bool root_files; };
-    std::vector<Top> tops;
-    for (uint32_t drv : f.nodes[0].children) {
-        const DirNode& dn = f.nodes[drv];
-        if (dn.self > 0) tops.push_back({ drv, dn.self, true });
-        for (uint32_t c : dn.children) tops.push_back({ c, f.nodes[c].count, false });
-    }
-    std::sort(tops.begin(), tops.end(), [](const Top& a, const Top& b) { return a.count > b.count; });
-    const uint64_t thr = fold_threshold(o, f.items);
-    int shown = 0, rest_n = 0;
-    uint64_t rest = 0;
-    for (const auto& t : tops) {
-        if (t.count < thr || shown >= o.top) { rest_n++; rest += t.count; continue; }
-        shown++;
-        if (t.root_files) {
-            out.push_back({ 0, narrow(f.dir_path(t.node)) + "  (files at the root)", t.count, 0, false, false, t.node });
-            continue;
-        }
-        uint32_t cur = t.node;
-        const std::wstring label = collapsed_label(f, cur, true);
-        out.push_back({ 0, narrow(label), f.nodes[cur].count, f.nodes[cur].bytes, true, false, cur });
-        expand_dir(f, o, cur, 1, thr, out);
-    }
-    if (rest_n) out.push_back({ 0, ssprintf("+%d more top-level %s", rest_n, rest_n == 1 ? "directory" : "directories"), rest, 0, false, true, 0 });
-    return out;
-}
-
-// --flat N: every prefix at depth N (plus the files of shallower directories), ranked
-static std::vector<DirLine> flat_lines(const Facets& f, const Opts& o) {
-    std::vector<DirLine> all;
-    for (uint32_t id = 1; id < (uint32_t)f.nodes.size(); ++id) {
-        const DirNode& n = f.nodes[id];
-        if (n.depth == (uint32_t)o.flat) all.push_back({ 0, narrow(f.dir_path(id)), n.count, n.bytes, true, false, id });
-        else if (n.depth < (uint32_t)o.flat && n.self > 0) all.push_back({ 0, narrow(f.dir_path(id)) + "  (files right here)", n.self, 0, false, false, id });
-    }
-    std::sort(all.begin(), all.end(), [](const DirLine& a, const DirLine& b) { return a.count > b.count; });
-    const uint64_t thr = fold_threshold(o, f.items);
-    std::vector<DirLine> out;
-    int rest_n = 0;
-    uint64_t rest = 0;
-    for (auto& l : all) {
-        if (l.count < thr || (int)out.size() >= o.top) { rest_n++; rest += l.count; continue; }
-        out.push_back(std::move(l));
-    }
-    if (rest_n) out.push_back({ 0, ssprintf("+%d more", rest_n), rest, 0, false, true, 0 });
-    return out;
-}
+// (DirLine / dir_lines / flat_lines / collapsed_label / fold_threshold live in facets.h — shared with the window)
 
 static void render_dirs(std::string& out, const Facets& f, const Opts& o, const RenderCtx& rc) {
     const bool ansi = rc.ansi;
@@ -1364,8 +1271,8 @@ int app_main(int argc, wchar_t** argv) {
         else if (a == "--since") o.since = need_str(argc, argv, i, "--since");
         else if (a == "--files") o.files_only = true;
         else if (a == "--folders") o.folders_only = true;
-        else if (a == "-t" || a == "--top") o.top = (int)std::clamp(need_num(argc, argv, i, "--top"), 1L, 500L);
-        else if (a == "-d" || a == "--depth") o.depth = (int)std::clamp(need_num(argc, argv, i, "--depth"), 0L, 32L);
+        else if (a == "-t" || a == "--top") { o.top = (int)std::clamp(need_num(argc, argv, i, "--top"), 1L, 500L); o.top_set = true; }
+        else if (a == "-d" || a == "--depth") { o.depth = (int)std::clamp(need_num(argc, argv, i, "--depth"), 0L, 32L); o.depth_set = true; }
         else if (a == "--flat") o.flat = (int)std::clamp(need_num(argc, argv, i, "--flat"), 1L, 32L);
         else if (a == "--min") { o.min_count = (int)std::clamp(need_num(argc, argv, i, "--min"), 1L, 1000000000L); o.min_set = true; }
         else if (a == "--burst-gap") o.burst_gap_s = (int)std::clamp(need_num(argc, argv, i, "--burst-gap"), 1L, 86400L);

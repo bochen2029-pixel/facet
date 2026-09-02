@@ -49,3 +49,34 @@ Running notes, newest at the bottom. Decisions, measurements, test results.
   (each descended the same way) relative to the split point. Bursts compile to dm:START..END.
 - Measurement trap (mine): a peak-memory probe that redirected stdout and only polled HasExited
   deadlocked — the child blocks on a full pipe. Read the pipe or don't redirect.
+
+## 2026-09-01 · milestone 2 — the window
+
+- Shape: query box (a subclassed EDIT) · chips bar · facet rail (custom-drawn, share bars behind
+  labels, section headers fold) · virtual results table (custom-drawn, server-side sort by
+  header click) · status line carrying the compiled query. Worker thread owns its own
+  Everything (one IPC reply window per thread); the UI thread only paints; a newer request
+  cancels the pass in flight at its next page (generation counter checked in the sink).
+- Every pick is a Filter chip; chips compile through the same query.h as the CLI, and the query
+  is re-run through Everything — no client-side filtering anywhere, so window counts, report
+  counts and Everything's status bar agree by construction.
+- Verified with real window messages (PostMessage clicks/keys from a DPI-aware pwsh driver,
+  PrintWindow captures): drill 3,812 → 2,841 · Esc → 3,812 · exclude → 971 · sort by size ·
+  keyboard selection · second exclude 971 → 798 · clean exit writing facet.ini.
+- Traps hit and logged:
+  · gdiplus.h needs <objidl.h> (WIN32_LEAN_AND_MEAN drops IStream/PROPID) and wants min/max as
+    functions once NOMINMAX is on (`using std::min; using std::max;` before the include);
+    `small` is a macro from rpcndr.h — never name a variable that.
+  · The window is sized in PHYSICAL pixels under PerMonitorV2: on this 225 % display a
+    1280×820 window is a postage stamp and the Path column collapsed to zero width. Scale the
+    default / minimum size by GetDpiForSystem.
+  · Without WS_CLIPCHILDREN the parent's double-buffered paint wipes the EDIT child; its text
+    only reappeared while the caret blinked. Symptom: the query box goes blank on focus loss.
+  · A DPI-unaware driver process sees a virtualized client rect (2762 → 1227) while the
+    coordinates it posts are taken as physical by the receiver — clicks land on the wrong rows.
+    SetProcessDpiAwarenessContext(-4) in the driver fixes both the hit-testing and the capture.
+  · PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT) captures child controls too; force
+    RedrawWindow(RDW_ALLCHILDREN | RDW_UPDATENOW) first. Downscaling the PNG with bicubic made
+    it 2.6× LARGER (ClearType noise compresses badly) — keep the native capture (~300 KB).
+- Rail defaults in the window: top 8, depth 2, and a subtree only opens when it holds >= 5 % of
+  the result set (also applied to the report), so the other facets stay reachable.

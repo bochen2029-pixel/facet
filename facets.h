@@ -109,4 +109,22 @@ private:
     uint64_t edge_today_ = 0, edge_yest_ = 0, edge_week_ = 0, edge_month_ = 0, edge_year_ = 0;
 };
 
+// ---- the directory view shared by the report, the JSON and the window ----
+struct DirLine {
+    int level = 0;
+    std::string label;          // UTF-8
+    uint64_t count = 0, bytes = 0;
+    bool has_bytes = true;
+    bool note = false;          // a fold / files-here line
+    uint32_t node = 0;          // 0 = none
+};
+// rows below this are folded into "+N more": --min verbatim, else 1 % of the result set
+uint64_t fold_threshold(const Opts& o, uint64_t items);
+// "a\b\c\" — a chain of single children with nothing of their own collapses to one label
+std::wstring collapsed_label(const Facets& f, uint32_t& cur, bool full_prefix);
+// top entries are drive + first folder, ranked across drives, each expanded o.depth levels
+std::vector<DirLine> dir_lines(const Facets& f, const Opts& o);
+// --flat N: every prefix at depth N (plus the files of shallower directories), ranked
+std::vector<DirLine> flat_lines(const Facets& f, const Opts& o);
+
 }  // namespace facet

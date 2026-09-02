@@ -18,6 +18,8 @@ Single ~0.5 MB exe. C/C++ only, OS APIs only, zero dependencies, no installer, n
 DLL. The index stays Everything's: facet speaks its WM_COPYDATA IPC (the channel `es.exe` uses),
 streams the result in pages, and folds them into facets with bounded memory.
 
+![facet — the rail you click, the chips it compiles, the rows Everything returns](docs/screenshot.png)
+
 ## Use
 
 ```
@@ -28,7 +30,7 @@ facet --flat 2 ""                      every item on every volume, ranked by dri
 facet -l -n 50 ext:md dm:today         rows, newest first  ·  -ll adds size + date  ·  -s size|name|path|ext  ·  -a
 facet -c ext:md                        count only (37 ms for the whole disk)
 facet -j ...                           JSON for agents: the report, rows with -l, the count with -c
-facet --gui [query]                    the window (milestone 2)  ·  facetw.exe opens it with no console at all
+facet --gui [query]                    the window: click a facet to drill in, right-click to exclude  ·  facetw.exe = no console
 facet --mcp                            MCP stdio server — tools: facet_query, facet_list, facet_count
 facet --selftest                       parser, fold, compiler, formatting + live IPC checks
 facet --help                           every flag, the JSON shape, exit codes
@@ -82,6 +84,30 @@ QUERY  ext:md dm:last3days
   counts the hand-paced tail: bursts of one or two files.
 - **QUERY** — the compiled Everything query. Every `-x` / `-i` / `-e` / `--since` / `--files` is
   in it; paste it into Everything's search box or into `search.py`.
+
+## The window
+
+`facet --gui [query]`, or double-click `facetw.exe`, is the same engine with a rail you click:
+
+- **Query box** — Everything syntax, verbatim; the search re-runs as you type (260 ms after the
+  last key), Enter runs it now.
+- **Facet rail** — the report's sections, live. Left-click a directory, extension, bucket or
+  burst to keep only it; right-click to exclude it. Each pick becomes a **chip**; the chips
+  compile into the query in the status line and the whole thing is re-run through Everything,
+  so every count is Everything's. `×` removes a chip, Esc clears them all. Right-click a `not …`
+  chip to pin it as a standing exclude: it is kept in `facet.ini` next to the exe and applied on
+  every launch — the noise list that keeps itself. Section headers fold and unfold.
+- **Results** — the rows, newest first; click a column to sort (Everything sorts, the list is
+  re-fetched); double-click or Enter opens a row; right-click: open its folder, copy its path,
+  only / exclude its folder; Delete excludes the selected row's folder; Ctrl+C copies the path.
+- Keys: Ctrl+L query · Esc clear filters · F5 rerun · Ctrl+Shift+C copy the compiled query ·
+  Ctrl+T pin on top.
+- `--shot FILE.png` renders the window once, saves it and exits — the screenshot above was
+  taken that way, no hands.
+
+Everything streams on a worker thread with its own IPC window; a new keystroke cancels the pass
+in flight at its next page. Up to 200,000 rows are kept for the table; the facets always cover
+the whole result set.
 
 ## The numbers, honestly
 

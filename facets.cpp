@@ -262,4 +262,87 @@ std::wstring Facets::row_path(const Row& r) const {
     return p;
 }
 
+// ---------------------------------------------------------------- the directory view
+uint64_t fold_threshold(const Opts& o, uint64_t items) {
+    if (o.min_set) return (uint64_t)o.min_count;
+    return std::max<uint64_t>((uint64_t)o.min_count, (items + 99) / 100);
+}
+
+std::wstring collapsed_label(const Facets& f, uint32_t& cur, bool full_prefix) {
+    std::wstring label = full_prefix ? f.dir_path(cur) : (f.nodes[cur].name + L"\\");
+    while (f.nodes[cur].children.size() == 1 && f.nodes[cur].self == 0) {
+        cur = f.nodes[cur].children[0];
+        label += f.nodes[cur].name + L"\\";
+    }
+    return label;
+}
+
+static void expand_dir(const Facets& f, const Opts& o, uint32_t node, int level, uint64_t thr, std::vector<DirLine>& out) {
+    if (level > o.depth) return;
+    const DirNode& n = f.nodes[node];
+    if (n.children.empty()) return;
+    int shown = 0, rest_n = 0;
+    uint64_t rest = 0;
+    for (uint32_t c : n.children) {
+        const uint64_t cnt = f.nodes[c].count;
+        if (cnt < thr || shown >= o.top) { rest_n++; rest += cnt; continue; }
+        shown++;
+        uint32_t cur = c;
+        const std::wstring label = collapsed_label(f, cur, false);
+        out.push_back({ level, narrow(label), f.nodes[cur].count, f.nodes[cur].bytes, true, false, cur });
+        if (f.nodes[cur].count * 20 >= f.items) expand_dir(f, o, cur, level + 1, thr, out);   // open only what holds >= 5 %
+    }
+    if (n.self > 0 && shown > 0) out.push_back({ level, "(files right here)", n.self, 0, false, true, node });
+    if (rest_n) out.push_back({ level, ssprintf("+%d more %s", rest_n, rest_n == 1 ? "directory" : "directories"), rest, 0, false, true, 0 });
+}
+
+std::vector<DirLine> dir_lines(const Facets& f, const Opts& o) {
+    std::vector<DirLine> out;
+    struct Top { uint32_t node; uint64_t count; bool root_files; };
+    std::vector<Top> tops;
+    for (uint32_t drv : f.nodes[0].children) {
+        const DirNode& dn = f.nodes[drv];
+        if (dn.self > 0) tops.push_back({ drv, dn.self, true });
+        for (uint32_t c : dn.children) tops.push_back({ c, f.nodes[c].count, false });
+    }
+    std::sort(tops.begin(), tops.end(), [](const Top& a, const Top& b) { return a.count > b.count; });
+    const uint64_t thr = fold_threshold(o, f.items);
+    int shown = 0, rest_n = 0;
+    uint64_t rest = 0;
+    for (const auto& t : tops) {
+        if (t.count < thr || shown >= o.top) { rest_n++; rest += t.count; continue; }
+        shown++;
+        if (t.root_files) {
+            out.push_back({ 0, narrow(f.dir_path(t.node)) + "  (files at the root)", t.count, 0, false, false, t.node });
+            continue;
+        }
+        uint32_t cur = t.node;
+        const std::wstring label = collapsed_label(f, cur, true);
+        out.push_back({ 0, narrow(label), f.nodes[cur].count, f.nodes[cur].bytes, true, false, cur });
+        if (f.nodes[cur].count * 20 >= f.items) expand_dir(f, o, cur, 1, thr, out);
+    }
+    if (rest_n) out.push_back({ 0, ssprintf("+%d more top-level %s", rest_n, rest_n == 1 ? "directory" : "directories"), rest, 0, false, true, 0 });
+    return out;
+}
+
+std::vector<DirLine> flat_lines(const Facets& f, const Opts& o) {
+    std::vector<DirLine> all;
+    for (uint32_t id = 1; id < (uint32_t)f.nodes.size(); ++id) {
+        const DirNode& n = f.nodes[id];
+        if (n.depth == (uint32_t)o.flat) all.push_back({ 0, narrow(f.dir_path(id)), n.count, n.bytes, true, false, id });
+        else if (n.depth < (uint32_t)o.flat && n.self > 0) all.push_back({ 0, narrow(f.dir_path(id)) + "  (files right here)", n.self, 0, false, false, id });
+    }
+    std::sort(all.begin(), all.end(), [](const DirLine& a, const DirLine& b) { return a.count > b.count; });
+    const uint64_t thr = fold_threshold(o, f.items);
+    std::vector<DirLine> out;
+    int rest_n = 0;
+    uint64_t rest = 0;
+    for (auto& l : all) {
+        if (l.count < thr || (int)out.size() >= o.top) { rest_n++; rest += l.count; continue; }
+        out.push_back(std::move(l));
+    }
+    if (rest_n) out.push_back({ 0, ssprintf("+%d more", rest_n), rest, 0, false, true, 0 });
+    return out;
+}
+
 }  // namespace facet
